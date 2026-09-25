@@ -3,50 +3,50 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <typeinfo>
-
 #include <cstdint>
-
 
 using namespace std;
 
-class CPUinstructionformat{
-   private:
+class CPUInstructionFormat {
+
+private:
+
     struct InstructionFields {
-        unit_32_t=opcode;
-        unit_32_t=rd;
-        unit_32_t=rs1;
-        unit_32_t=rs2;
-        unit_32_t=immediate;
-        unit_8_t=modifier;
-        unit_32_t=MatrixSize;
+
+        uint32_t opcode = 0;
+        uint32_t rd = 0;
+        uint32_t rs1 = 0;
+        uint32_t rs2 = 0;
+        uint32_t immediate = 0;
+
+        uint8_t modifier = 0;
+
+        uint32_t matrixSize = 0;
     };
 
-    
-     unit_64_t=vector<int> registers(16);
+    vector<int64_t> registers = vector<int64_t>(16);
 
-       static constexpr int ZERO = 0;
-       static constexpr int SP = 13;
-       static constexpr int LR = 14;
-       static constexpr int PC = 15;
+    static constexpr int ZERO = 0;
+    static constexpr int SP = 13;
+    static constexpr int LR = 14;
+    static constexpr int PC = 15;
 
-      vector<InstructionFields> instructionSet(5);
-    /* instructionSet[0]=alutype instruction
-    instructionSet[1]=immediatetype instruction
-    instructionSet[2]=branch instruction
-    instructionSet[3]=memorytype instruction
-    instructionSet[4]=matrixoperation instruction
-    */
+    vector<InstructionFields> instructionSet =
+        vector<InstructionFields>(5);
 
-    static constexpr int TOTAL_INSTRUCTIONS=40;
+public:
+
+    static constexpr int TOTAL_INSTRUCTIONS = 40;
+
     enum class InstructionType {
         ALU,
         IMMEDIATE,
         BRANCH,
         JUMP,
-        MEMORY
-    }; 
-    
+        MEMORY,
+        MATRIX
+    };
+
     enum class ALUInstruction {
         ADD,
         SUB,
@@ -65,56 +65,44 @@ class CPUinstructionformat{
         COS,
         LOG,
         EXP,
-        POW,
-        };
+        POW
+    };
 
-   
-     enum  class MATRIXInstruction {
-        MATMUL;
-        MATADD;
-        MATTRANSPOSE;
-        MATINVERSE;
-        MATADJOINT;
-        MATDETERMINANT;
-     };
+    enum class MATRIXInstruction {
+        MATMUL,
+        MATADD,
+        MATSUB,
+        MATTRANSPOSE,
+        MATINVERSE,
+        MATADJOINT,
+        MATDETERMINANT
+    };
 
-     enum class MEMORYInstruction {
-        LOAD;
-        STORE;
-        ATOMIC_MEMORY_OPS;
-        SEQUENTIAL_MEMORY_OPS;
-        STRING_MEMORY_OPS;
-     };
+    enum class MEMORYInstruction {
+        LOAD,
+        STORE,
+        ATOMIC_MEMORY_OPS,
+        SEQUENTIAL_MEMORY_OPS,
+        STRING_MEMORY_OPS
+    };
 
+    enum class BRANCHInstruction {
 
-     enum class BRANCHInstruction{
-        /*Conditional branch*/
-        JEQ;
-        JGT;
-        JZ;
-        JNZ;
+        JEQ,
+        JGT,
+        JZ,
+        JNZ,
 
-        /*Loop conditions*/
-        LOOPZ;
-        LOOPNZ;
+        LOOPZ,
+        LOOPNZ,
 
-        /*Unconditional branch*/
-        JMP;
+        JMP,
 
-        /*procedural instructions*/
-        CALL:
-        RET;
-     }
+        CALL,
+        RET
+    };
 
-     vector<InstructionFields> getInstructionSet() const {
-         return instructionSet;
-     }
-
-
-
-
-
-
-
-     
+    vector<InstructionFields> getInstructionSet() const {
+        return instructionSet;
+    }
 };
