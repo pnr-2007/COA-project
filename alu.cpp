@@ -48,17 +48,7 @@ public:
         bool overflow = false;
     };
 
-    static double targetPolynomialHost(double x) {
-        return 2.0 * (x * x * x) - 3.0 * (x * x) + 5.0;
-    }
-
-    // Tables are built lazily and thread-safely on first use; calling this
-    // is optional and only forces the build up front.
-    static void initTranscendentalLUTs() { (void)luts(); }
-
     // ---- Transcendental functions -------------------------------------------------
-
-    static Result evaluatePolynomial(Word x) { return interpolate(x, luts().poly); }
 
     static Result evaluateSine(Word x_fixed) {
         uint64_t s = x_fixed % TWO_PI_FX;
@@ -160,7 +150,11 @@ public:
             r.overflow = true;
             return r;
         }
-        return logicFlagsOnly(static_cast<uint64_t>(dividend) % static_cast<uint64_t>(divisor));
+        Word v = static_cast<uint64_t>(dividend) % static_cast<uint64_t>(divisor);
+        Result r;
+        r.value = v;
+        setFlags(r);
+        return r;
     }
 
     // =================================================================================
@@ -534,12 +528,11 @@ private:
     using LUT = std::array<Word, POLY_LUT_SIZE>;
 
     struct Tables {
-        LUT poly{}, sine{}, cosine{}, log2{};
+        LUT sine{}, cosine{}, log2{};
         Tables() {
             for (uint32_t i = 0; i < POLY_LUT_SIZE; ++i) {
                 const double x = static_cast<double>(i) / POLY_SEGMENTS;
                 const double rad = x * (M_PI / 2.0);
-                poly[i]   = static_cast<Word>(targetPolynomialHost(x) * FX_SCALE);
                 sine[i]   = static_cast<Word>(std::sin(rad) * FX_SCALE);
                 cosine[i] = static_cast<Word>(std::cos(rad) * FX_SCALE);
                 log2[i]   = static_cast<Word>(std::log2(1.0 + x) * FX_SCALE);
@@ -563,8 +556,6 @@ private:
         setFlags(r);
         return r;
     }
-
-    static Result logicFlagsOnly(Word v) { return logic(v); }
 
     // Map a value in [0, pi/2] (Q32) to a LUT input in [0, 1] (Q32).
     // 128-bit intermediate: the original 64-bit product overflowed.
@@ -603,7 +594,3 @@ private:
         return addc(y0, static_cast<Word>(offset), 0);
     }
 };
-
-         
-
-     
