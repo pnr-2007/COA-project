@@ -1,0 +1,5 @@
+; sum demo
+ADD R1, R2, R3
+ADD R4, R1, R3
+SUB R5, R4, R2
+HALT
