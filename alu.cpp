@@ -454,14 +454,20 @@ public:
                                         const Matrix& A, const Matrix& B) {
         MatrixResult bad;
         if (f.type() != ISA::InstructionType::MATRIX) { bad.unsupported = true; return bad; }
+        if (f.opcode == ISA::Opcode::MATMUL) {
+            // A is rows x inner, B is inner x cols, result is rows x cols
+            if (f.matrixRows != A.rows || f.matrixInner != A.cols ||
+                f.matrixInner != B.rows || f.matrixCols != B.cols) {
+                bad.dimensionMismatch = true;
+                return bad;
+            }
+            return matMul(A, B);
+        }
         if (f.matrixRows != A.rows || f.matrixCols != A.cols) { bad.dimensionMismatch = true; return bad; }
 
         switch (f.opcode) {
             case ISA::Opcode::MATADD:         return matAdd(A, B);
             case ISA::Opcode::MATMUL:         return matMul(A, B);
-            case ISA::Opcode::MATTRANSPOSE:   return matTranspose(A);
-            case ISA::Opcode::MATINVERSE:     return matInverse(A);
-            case ISA::Opcode::MATADJOINT:     return matAdjoint(A);
             case ISA::Opcode::MATDETERMINANT: return matDeterminant(A);
             default:                          bad.unsupported = true; return bad;
         }
@@ -615,3 +621,4 @@ private:
         return r;
     }
 };
+
