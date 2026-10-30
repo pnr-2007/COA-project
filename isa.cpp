@@ -6,6 +6,8 @@
 #include <string>
 #include <string_view>
 
+using namespace std;
+
 class ISA {
 public:
     static constexpr uint8_t OPCODE_BITS     = 6;
@@ -30,7 +32,7 @@ public:
     enum class Opcode : uint8_t {
         ADD = 0, SUB, MUL, DIV, MOD, AND, OR, XOR, NOT, LSL, LSR, ASR,
         SIN, COS, LOG, EXP, POW, CMP,
-        MATMUL, MATADD, MATTRANSPOSE, MATINVERSE, MATADJOINT, MATDETERMINANT,
+        MATMUL, MATADD, MATDETERMINANT,
         LOAD, STORE,
         JEQ, JGT, JZ, JNZ, JMP, CALL, RET,
         NOP, HALT,
@@ -74,9 +76,6 @@ public:
             // MATRIX
             {InstructionFormat::M_TYPE, InstructionType::MATRIX, "MATMUL", false},
             {InstructionFormat::M_TYPE, InstructionType::MATRIX, "MATADD", false},
-            {InstructionFormat::M_TYPE, InstructionType::MATRIX, "MATTRANSPOSE", false},
-            {InstructionFormat::M_TYPE, InstructionType::MATRIX, "MATINVERSE", false},
-            {InstructionFormat::M_TYPE, InstructionType::MATRIX, "MATADJOINT", false},
             {InstructionFormat::M_TYPE, InstructionType::MATRIX, "MATDETERMINANT", false},
             // MEMORY
             {InstructionFormat::I_TYPE, InstructionType::MEMORY, "LOAD", false},
@@ -174,6 +173,8 @@ public:
                     else            f.rs2 = (word >> 13) & 0xF;
                 }
                 break;
+
+                
             case InstructionFormat::I_TYPE:
                 f.rd        = (word >> 22) & 0xF;
                 f.rs1       = (word >> 18) & 0xF;
@@ -210,3 +211,5 @@ static_assert((1u << ISA::REGISTER_BITS) == ISA::REGISTER_COUNT, "");
 static_assert((1u << ISA::MATRIX_DIM_BITS) - 1 >= ISA::MAX_MATRIX_ROWS, "");
 static_assert((1u << ISA::MATRIX_DIM_BITS) - 1 >= ISA::MAX_MATRIX_COLS, "");
 static_assert((1u << ISA::OPCODE_BITS) >= ISA::opcodeValue(ISA::Opcode::OPCODE_COUNT), "");
+
+
