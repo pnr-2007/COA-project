@@ -1,55 +1,37 @@
 #pragma once
 
 #include "exec.cpp"
+#include "matrix_unit.cpp"
 #include <vector>
 
-// Four-stage in-order pipeline, cycle accurate:
-//
-//     IF  |  DE+EX  |  MA  |  RW
-//
-//   IF     fetch the instruction at PC, PC += 4
-//   DE+EX  decode, read registers, execute (ALU op, branch decision, address calculation)
-//   MA     data-memory access for LOAD / STORE
-//   RW     write the register file, retire, take faults and HALT
-//
-// THERE IS NO HAZARD UNIT YET. That means:
-//   * No forwarding. A register written by an instruction is visible to the instruction
-//     two places later (the register file is written in the first half of the cycle and
-//     read in the second), but NOT to the very next instruction. Put one instruction
-//     (a NOP) between a producer and its consumer. `Stats::rawHazards` counts the times
-//     this was violated, so a test program can assert that it padded correctly.
-//   * No load-use stall; LOAD follows the same one-instruction gap rule.
-//   * No branch flush. A taken branch redirects the PC, but the instruction already fetched
-//     behind it still executes (an exposed delay slot). Put a NOP after every branch.
-//     CALL saves PC+4, which is that slot instruction.
-//
-// The only stall is structural: a long operation (MUL, DIV, ...) keeps DE+EX busy for
-// `Config::longOpCycles` cycles, holding the IF/DE register and feeding bubbles to MA.
-//
-// Faults (SPEC.md section 6) travel with the instruction and take effect at RW, so every
-// older instruction has committed and no younger one has. HALT behaves the same way.
 class Pipeline {
 public:
     using Word  = ISA::Word;
     using Fault = Exec::Fault;
 
     struct Config {
-        size_t   imemBytes    = 1 << 18;   // 256 KiB
-        size_t   dmemBytes    = 1 << 19;   // 512 KiB
-        uint32_t longOpCycles = 64;        // cycles a MUL/DIV/MOD/SIN/COS/LOG spends in DE+EX (placeholder)
+        size_t   imemBytes    = 1 << 18;
+        size_t   dmemBytes    = 1 << 19;
+        uint32_t longOpCycles = 64;
+        MatrixUnit::Config matrix;
     };
 
     struct Stats {
-        uint64_t cycles         = 0;
-        uint64_t retired        = 0;   // instructions that committed (HALT included, faulting one not)
-        uint64_t takenBranches  = 0;
-        uint64_t execBusyCycles = 0;   // cycles lost waiting for a long operation
-        uint64_t rawHazards     = 0;   // reads of a register the previous instruction is about to write
+        uint64_t cycles            = 0;
+        uint64_t retired           = 0;
+        uint64_t takenBranches     = 0;
+        uint64_t execBusyCycles    = 0;
+        uint64_t rawHazards        = 0;
+        uint64_t matrixOps         = 0;
+        uint64_t matrixStallCycles = 0;
+        uint64_t drainCycles       = 0;
     };
 
     Pipeline() : Pipeline(Config()) {}
     explicit Pipeline(const Config& cfg)
-        : cfg_(cfg), imem_(cfg.imemBytes / 4, 0xFFFFFFFFu), dmem_(cfg.dmemBytes / 8, 0) {}
+        : cfg_(cfg), imem_(cfg.imemBytes / 4, 0xFFFFFFFFu), dmem_(cfg.dmemBytes / 8, 0), mu_(dmem_, cfg.matrix) {}
+    Pipeline(const Pipeline&) = delete;
+    Pipeline& operator=(const Pipeline&) = delete;
 
     void loadProgram(const std::vector<ISA::InstrWord>& words, uint64_t baseBytes = 0) {
         if ((baseBytes & 3) != 0 || baseBytes + words.size() * 4 > cfg_.imemBytes)
@@ -57,21 +39,27 @@ public:
         for (size_t i = 0; i < words.size(); ++i) imem_[(baseBytes >> 2) + i] = words[i];
     }
 
-    // Advance one clock cycle.
     void step() {
         if (halted_) return;
         ++stats_.cycles;
 
-        // ---- RW: runs first, so DE+EX below reads the freshly written register file ----
-        if (maRw_.valid) {
-            if (maRw_.fault != Fault::None) { fault_ = maRw_.fault; halted_ = true; return; }
-            if (maRw_.regWrite && maRw_.rd != ISA::ZERO) regs_[maRw_.rd] = maRw_.value;
-            ++stats_.retired;
-            if (maRw_.halt) { halted_ = true; return; }
+        if (draining_) {
+            ++stats_.drainCycles;
+            mu_.step();
+            if (!mu_.busy()) halted_ = true;
+            return;
         }
 
-        // ---- MA ----
-        bool squash = false;                      // a memory fault kills everything younger
+        if (maRw_.valid) {
+            if (maRw_.fault != Fault::None) { fault_ = maRw_.fault; beginDrain(); return; }
+            if (maRw_.regWrite && maRw_.rd != ISA::ZERO) regs_[maRw_.rd] = maRw_.value;
+            ++stats_.retired;
+            if (maRw_.halt) { beginDrain(); return; }
+        }
+
+        if (mu_.step()) matBusy_ = false;
+
+        bool squash = false;
         MaRw nextMaRw;
         if (exMa_.valid) {
             nextMaRw.valid    = true;
@@ -81,22 +69,36 @@ public:
             nextMaRw.halt     = exMa_.halt;
             nextMaRw.fault    = exMa_.fault;
             nextMaRw.value    = exMa_.value;
-            if (exMa_.fault == Fault::None && (exMa_.memRead || exMa_.memWrite)) {
-                const Word addr = exMa_.value;
-                if ((addr & 7) != 0 || addr >= cfg_.dmemBytes) {
-                    nextMaRw.fault    = Fault::MemoryFault;
-                    nextMaRw.regWrite = false;
-                    squash = true;
-                } else if (exMa_.memRead) {
-                    nextMaRw.value = dmem_[addr >> 3];
-                } else {
-                    dmem_[addr >> 3] = exMa_.storeData;
+            if (exMa_.fault == Fault::None) {
+                if (exMa_.matrixOp) {
+                    const MatrixUnit::StartResult r =
+                        mu_.start(exMa_.matFields, exMa_.matPtrD, exMa_.matPtrA, exMa_.matPtrB);
+                    if (r == MatrixUnit::StartResult::Started) {
+                        ++stats_.matrixOps;
+                    } else if (r == MatrixUnit::StartResult::Busy) {
+                        throw std::logic_error("Pipeline: matrix unit started while busy");
+                    } else {
+                        nextMaRw.fault = (r == MatrixUnit::StartResult::MemoryFault) ? Fault::MemoryFault
+                                                                                      : Fault::IllegalInstruction;
+                        squash   = true;
+                        matBusy_ = false;
+                    }
+                } else if (exMa_.memRead || exMa_.memWrite) {
+                    const Word addr = exMa_.value;
+                    if ((addr & 7) != 0 || addr >= cfg_.dmemBytes) {
+                        nextMaRw.fault    = Fault::MemoryFault;
+                        nextMaRw.regWrite = false;
+                        squash = true;
+                    } else if (exMa_.memRead) {
+                        nextMaRw.value = dmem_[addr >> 3];
+                    } else {
+                        dmem_[addr >> 3] = exMa_.storeData;
+                    }
                 }
             }
         }
 
-        // ---- DE+EX ----
-        ExMa nextExMa;                            // bubble unless something completes
+        ExMa nextExMa;
         bool stallFetch = false, stopFetch = false, redirect = false;
         uint64_t target = 0;
 
@@ -107,7 +109,6 @@ public:
             decodeExecute(nextExMa, stopFetch, redirect, target, stallFetch);
         }
 
-        // ---- IF ----
         IfDe nextIfDe;
         if (squash || stopFetch) {
             fetchEnabled_ = false;
@@ -115,19 +116,19 @@ public:
         } else if (stallFetch) {
             nextIfDe = ifDe_;
         } else if (fetchEnabled_) {
-            nextIfDe = fetch();                   // fetches the sequential instruction, PC += 4
+            nextIfDe = fetch();
         }
-        if (redirect && !squash && !stopFetch) {  // taken branch: next fetch is the target
+        if (redirect && !squash && !stopFetch) {
             pc_ = target;
             ++stats_.takenBranches;
         }
+        if (nextExMa.valid && nextExMa.matrixOp) matBusy_ = true;
 
         maRw_ = nextMaRw;
         exMa_ = nextExMa;
         ifDe_ = nextIfDe;
     }
 
-    // Run until HALT, a fault, or maxCycles. Returns true if the machine stopped.
     bool run(uint64_t maxCycles) {
         while (!halted_ && stats_.cycles < maxCycles) step();
         return halted_;
@@ -136,9 +137,11 @@ public:
     bool         halted() const { return halted_; }
     Fault        fault()  const { return fault_; }
     const Stats& stats()  const { return stats_; }
+    const MatrixUnit::Stats& matrixStats() const { return mu_.stats(); }
     uint64_t     pc()     const { return pc_; }
     Word         reg(unsigned i) const { return regs_[i]; }
     const std::vector<Word>& dmem() const { return dmem_; }
+    void pokeDmem(size_t wordIndex, Word value) { dmem_.at(wordIndex) = value; }
 
 private:
     struct IfDe {
@@ -148,10 +151,13 @@ private:
     };
     struct ExMa {
         bool valid = false, regWrite = false, memRead = false, memWrite = false, halt = false;
+        bool matrixOp = false;
         uint64_t pc = 0;
         uint8_t  rd = 0;
-        Word     value = 0;       // ALU result, link address, or memory address
+        Word     value = 0;
         Word     storeData = 0;
+        ISA::InstructionFields matFields;
+        Word     matPtrD = 0, matPtrA = 0, matPtrB = 0;
         Fault    fault = Fault::None;
     };
     struct MaRw {
@@ -166,6 +172,11 @@ private:
         uint32_t remaining = 0;
         ExMa result;
     };
+
+    void beginDrain() {
+        draining_ = true;
+        if (!mu_.busy()) halted_ = true;
+    }
 
     IfDe fetch() {
         IfDe r;
@@ -196,20 +207,28 @@ private:
         if (bad != Fault::None) { out.fault = bad; stopFetch = true; return; }
         if (f.opcode == ISA::Opcode::HALT) { out.halt = true; stopFetch = true; return; }
 
+        const bool isMatrix = f.type() == ISA::InstructionType::MATRIX;
+        if ((isMatrix || f.opcode == ISA::Opcode::MATWAIT) && matBusy_) {
+            out = ExMa();
+            stallFetch = true;
+            ++stats_.matrixStallCycles;
+            return;
+        }
+
         const Exec::RegUse u = Exec::regUse(f);
 
-        // No hazard unit: count the reads that will see a stale value.
         if (exMa_.valid && exMa_.regWrite && exMa_.rd != ISA::ZERO &&
-            ((u.readsA && u.a == exMa_.rd) || (u.readsB && u.b == exMa_.rd)))
+            ((u.readsA && u.a == exMa_.rd) || (u.readsB && u.b == exMa_.rd) || (u.readsC && u.c == exMa_.rd)))
             ++stats_.rawHazards;
 
         auto readReg = [&](uint8_t r) -> Word {
             if (r == ISA::ZERO) return 0;
-            if (r == ISA::PC)   return ifDe_.pc;     // R15 reads as the instruction's own address
+            if (r == ISA::PC)   return ifDe_.pc;
             return regs_[r];
         };
         const Word a = u.readsA ? readReg(u.a) : 0;
         const Word b = u.readsB ? readReg(u.b) : 0;
+        const Word c = u.readsC ? readReg(u.c) : 0;
         const Word imm = static_cast<Word>(static_cast<int64_t>(f.immediate));
 
         out.regWrite = u.writes;
@@ -222,14 +241,14 @@ private:
                     busy_.active    = true;
                     busy_.remaining = cfg_.longOpCycles - 1;
                     busy_.result    = out;
-                    out             = ExMa();         // nothing reaches MA until it finishes
+                    out             = ExMa();
                     stallFetch      = true;
                     ++stats_.execBusyCycles;
                 }
                 break;
             }
             case ISA::InstructionType::MEMORY:
-                out.value = a + imm;                  // byte address
+                out.value = a + imm;
                 if (f.opcode == ISA::Opcode::LOAD) out.memRead = true;
                 else { out.memWrite = true; out.storeData = b; }
                 break;
@@ -242,17 +261,27 @@ private:
                 }
                 if (f.opcode == ISA::Opcode::CALL) out.value = ifDe_.pc + 4;
                 break;
-            default: break;                           // NOP
+            case ISA::InstructionType::MATRIX:
+                out.matrixOp = true;
+                out.matFields = f;
+                out.matPtrD = c;
+                out.matPtrA = a;
+                out.matPtrB = b;
+                break;
+            default: break;
         }
     }
 
     Config cfg_;
     std::vector<ISA::InstrWord> imem_;
     std::vector<Word>           dmem_;
+    MatrixUnit                  mu_;
     ISA::RegisterFile           regs_{};
     uint64_t pc_ = 0;
     bool     fetchEnabled_ = true;
     bool     halted_ = false;
+    bool     draining_ = false;
+    bool     matBusy_ = false;
     Fault    fault_ = Fault::None;
 
     IfDe ifDe_;
