@@ -1,55 +1,43 @@
 #pragma once
 
-#include "exec.cpp"
 #include <cstdint>
 
-enum class ExceptionCode : uint8_t {
-    None               = 0,
-    IllegalInstruction = 1,
-    MemoryFault        = 2,
-    FetchFault         = 3,
-    DivideByZero       = 4,
-    Overflow           = 5
-};
-
-class ExceptionHandler {
+class InterruptHandler {
 public:
-    static constexpr uint64_t EXCEPTION_VECTOR_BASE = 0x00000080;
+    static constexpr uint64_t IRQ_VECTOR_BASE = 0x00000100;
 
-    struct ExceptionRecord {
-        bool active           = false;
-        ExceptionCode code    = ExceptionCode::None;
-        uint64_t epc          = 0;
-        uint64_t faultAddress = 0;
+    struct InterruptState {
+        bool pending           = false;
+        uint8_t irqVector      = 0;
+        uint64_t returnPC      = 0;
+        bool interruptsEnabled = true;
     };
 
-    inline void raiseException(Exec::Fault fault, uint64_t faultPC, uint64_t faultAddr = 0) {
-        if (record_.active) return;
-        record_.active = true;
-        record_.epc = faultPC;
-        record_.faultAddress = faultAddr;
+    inline void setInterruptEnable(bool enable) { state_.interruptsEnabled = enable; }
+    inline bool isEnabled() const { return state_.interruptsEnabled; }
+    inline bool isPending() const { return state_.pending && state_.interruptsEnabled; }
 
-        switch (fault) {
-            case Exec::Fault::IllegalInstruction: record_.code = ExceptionCode::IllegalInstruction; break;
-            case Exec::Fault::MemoryFault:        record_.code = ExceptionCode::MemoryFault;        break;
-            case Exec::Fault::FetchFault:         record_.code = ExceptionCode::FetchFault;         break;
-            default:                               record_.code = ExceptionCode::None;               break;
-        }
+    inline void raiseIRQ(uint8_t vector, uint64_t currentPC) {
+        if (!state_.interruptsEnabled) return;
+        state_.pending   = true;
+        state_.irqVector = vector;
+        state_.returnPC  = currentPC;
     }
 
-    inline void raiseALUException(ExceptionCode code, uint64_t faultPC) {
-        if (record_.active) return;
-        record_.active = true;
-        record_.code   = code;
-        record_.epc    = faultPC;
+    inline uint64_t serviceIRQ() {
+        if (!state_.pending) return 0;
+        state_.pending = false;
+        state_.interruptsEnabled = false; // Disable nested IRQs by default
+        return IRQ_VECTOR_BASE + (static_cast<uint64_t>(state_.irqVector) * 16);
     }
 
-    inline bool hasException() const { return record_.active; }
-    inline uint64_t trapVector() const { return EXCEPTION_VECTOR_BASE; }
-    inline void clear() { record_ = ExceptionRecord(); }
+    inline uint64_t returnFromInterrupt() {
+        state_.interruptsEnabled = true;
+        return state_.returnPC;
+    }
 
-    const ExceptionRecord& record() const { return record_; }
+    const InterruptState& state() const { return state_; }
 
 private:
-    ExceptionRecord record_;
+    InterruptState state_;
 };
