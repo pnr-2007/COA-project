@@ -35,7 +35,7 @@ public:
         MATMUL, MATADD, MATDETERMINANT,
         LOAD, STORE,
         JEQ, JGT, JZ, JNZ, JMP, CALL, RET,
-        NOP, HALT,
+        NOP, HALT, MATWAIT,
         OPCODE_COUNT
     };
 
@@ -90,7 +90,8 @@ public:
             {InstructionFormat::J_TYPE, InstructionType::BRANCH, "RET", false},
             // SYSTEM
             {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "NOP", false},
-            {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "HALT", false}
+            {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "HALT", false},
+            {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "MATWAIT", false}
         };
         return table[opcodeValue(op)];
     }
@@ -117,6 +118,7 @@ public:
         uint8_t  modifier   = 0;
         uint8_t  matrixRows = 0;
         uint8_t  matrixCols = 0;
+        uint8_t  matrixInner = 0;
 
         InstructionFormat format() const { return ISA::formatOf(opcode); }
         InstructionType   type()   const { return ISA::typeOf(opcode); }
@@ -147,8 +149,12 @@ public:
                 word |= f.immediate & 0x3FFFFFF;
                 break;
             case InstructionFormat::M_TYPE:
-                word |= (f.rd & 0xF) << 22 | (f.rs1 & 0xF) << 18 | (f.rs2 & 0xF) << 14 |
-                        (f.matrixRows & 0x1F) << 9 | (f.matrixCols & 0x1F) << 4;
+                word |= (f.rd & 0xF) << 22 | (f.rs1 & 0xF) << 18 | (f.rs2 & 0xF) << 14;
+                if (f.opcode == Opcode::MATMUL) {
+                    word |= packMatmulDims(f.matrixRows, f.matrixInner, f.matrixCols) << 1;
+                } else {
+                    word |= (f.matrixRows & 0x1F) << 9 | (f.matrixCols & 0x1F) << 4;
+                }
                 break;
         }
         return word;
@@ -193,14 +199,40 @@ public:
                 f.rd         = (word >> 22) & 0xF;
                 f.rs1        = (word >> 18) & 0xF;
                 f.rs2        = (word >> 14) & 0xF;
-                f.matrixRows = (word >> 9) & 0x1F;
-                f.matrixCols = (word >> 4) & 0x1F;
+                if (f.opcode == Opcode::MATMUL) {
+                    unpackMatmulDims((word >> 1) & MATMUL_DIM_MASK, f);
+                } else {
+                    f.matrixRows = (word >> 9) & 0x1F;
+                    f.matrixCols = (word >> 4) & 0x1F;
+                }
                 break;
         }
         return f;
     }
 
 private:
+    static constexpr uint32_t MATMUL_RADIX     = MAX_MATRIX_ROWS;
+    static constexpr uint32_t MATMUL_DIM_BITS  = 13;
+    static constexpr uint32_t MATMUL_DIM_MASK  = (1u << MATMUL_DIM_BITS) - 1;
+    static constexpr uint32_t MATMUL_DIM_COUNT = MATMUL_RADIX * MATMUL_RADIX * MATMUL_RADIX;
+
+    static uint32_t packMatmulDims(uint8_t rows, uint8_t inner, uint8_t cols) {
+        auto inRange = [](uint8_t d) { return d >= 1 && d <= MATMUL_RADIX; };
+        if (!inRange(rows) || !inRange(inner) || !inRange(cols)) {
+            throw std::invalid_argument("ISA::encode: MATMUL dimensions must be in 1..MAX_MATRIX_ROWS");
+        }
+        return (rows - 1) + MATMUL_RADIX * ((inner - 1) + MATMUL_RADIX * (cols - 1));
+    }
+
+    static void unpackMatmulDims(uint32_t packed, InstructionFields& f) {
+        if (packed >= MATMUL_DIM_COUNT) {
+            throw std::invalid_argument("ISA::decode: invalid MATMUL dimension encoding");
+        }
+        f.matrixRows  = static_cast<uint8_t>(packed % MATMUL_RADIX + 1);
+        f.matrixInner = static_cast<uint8_t>((packed / MATMUL_RADIX) % MATMUL_RADIX + 1);
+        f.matrixCols  = static_cast<uint8_t>(packed / (MATMUL_RADIX * MATMUL_RADIX) + 1);
+    }
+
     static constexpr int32_t signExtend(uint32_t value, uint8_t bits) {
         uint32_t signBit = 1u << (bits - 1);
         return static_cast<int32_t>((value ^ signBit) - signBit);
@@ -210,6 +242,8 @@ private:
 static_assert((1u << ISA::REGISTER_BITS) == ISA::REGISTER_COUNT, "");
 static_assert((1u << ISA::MATRIX_DIM_BITS) - 1 >= ISA::MAX_MATRIX_ROWS, "");
 static_assert((1u << ISA::MATRIX_DIM_BITS) - 1 >= ISA::MAX_MATRIX_COLS, "");
+static_assert(ISA::MAX_MATRIX_ROWS == ISA::MAX_MATRIX_COLS, "MATMUL packing assumes square max dimensions");
+static_assert(static_cast<uint32_t>(ISA::MAX_MATRIX_ROWS) * ISA::MAX_MATRIX_ROWS * ISA::MAX_MATRIX_ROWS <= (1u << 13),
+              "MATMUL packed dimensions must fit in 13 bits");
 static_assert((1u << ISA::OPCODE_BITS) >= ISA::opcodeValue(ISA::Opcode::OPCODE_COUNT), "");
-
 
