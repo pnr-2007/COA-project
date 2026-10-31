@@ -12,6 +12,7 @@ public:
     struct RegUse {
         bool readsA = false; uint8_t a = 0;
         bool readsB = false; uint8_t b = 0;
+        bool readsC = false; uint8_t c = 0;
         bool writes = false; uint8_t dest = 0;
     };
 
@@ -39,13 +40,36 @@ public:
                     default: break;
                 }
                 break;
+            case ISA::InstructionType::MATRIX:
+                u.readsC = true; u.c = f.rd;
+                u.readsA = true; u.a = f.rs1;
+                if (f.opcode != Opcode::MATDETERMINANT) { u.readsB = true; u.b = f.rs2; }
+                break;
             default: break;
         }
         return u;
     }
 
+    static void matrixWords(const ISA::InstructionFields& f, unsigned& a, unsigned& b, unsigned& out) {
+        const unsigned rows = f.matrixRows, inner = f.matrixInner, cols = f.matrixCols;
+        switch (f.opcode) {
+            case Opcode::MATADD: a = b = out = rows * cols; break;
+            case Opcode::MATMUL: a = rows * inner; b = inner * cols; out = rows * cols; break;
+            default:             a = rows * rows;  b = 0;            out = 1;           break;
+        }
+    }
+
+    static bool regionOk(Word ptr, uint64_t words, uint64_t dmemBytes) {
+        return (ptr & 7) == 0 && ptr <= dmemBytes && words * 8 <= dmemBytes - ptr;
+    }
+
     static Fault validate(const ISA::InstructionFields& f) {
-        if (f.type() == ISA::InstructionType::MATRIX) return Fault::IllegalInstruction;
+        if (f.type() == ISA::InstructionType::MATRIX) {
+            auto dimOk = [](unsigned d) { return d >= 1 && d <= ISA::MAX_MATRIX_ROWS; };
+            if (!dimOk(f.matrixRows) || !dimOk(f.matrixCols)) return Fault::IllegalInstruction;
+            if (f.opcode == Opcode::MATMUL && !dimOk(f.matrixInner)) return Fault::IllegalInstruction;
+            if (f.opcode == Opcode::MATDETERMINANT && f.matrixRows != f.matrixCols) return Fault::IllegalInstruction;
+        }
         if (f.opcode == Opcode::EXP || f.opcode == Opcode::POW) return Fault::IllegalInstruction;
         if ((f.opcode == Opcode::LOAD || f.opcode == Opcode::STORE) && f.modifier != 0) return Fault::IllegalInstruction;
         const RegUse u = regUse(f);
