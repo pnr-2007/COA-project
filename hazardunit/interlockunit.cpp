@@ -1,51 +1,40 @@
 #pragma once
 
-#include "isa.cpp"
 #include "exec.cpp"
-
-struct InterlockSignals {
-    bool stallFetch   = false;
-    bool stallDecode  = false;
-    bool stallExecute = false;
-    bool flushDecode  = false;
-    bool flushExecute = false;
-};
+#include "forwarding_unit.cpp"
 
 class InterlockUnit {
 public:
-    static inline InterlockSignals evaluate(const Exec::RegUse& idUse,
-                                            bool exMemRead, uint8_t exRd,
-                                            bool matrixUnitBusy,
-                                            bool aluBusy,
-                                            bool branchMispredicted) {
-        InterlockSignals sigs;
+    enum class Stall : uint8_t { None, LoadUse, MatrixBusy, Serialize };
 
-        // 1. Branch Misprediction Flush
-        if (branchMispredicted) {
-            sigs.flushDecode  = true;
-            sigs.flushExecute = true;
-            return sigs;
+    struct Stats {
+        uint64_t loadUse = 0;
+        uint64_t matrixBusy = 0;
+        uint64_t serialize = 0;
+    };
+
+    struct Query {
+        const Exec::RegUse* use = nullptr;
+        bool isMatrixOrWait = false;
+        bool isSerializing = false;
+        bool matrixBusy = false;
+        ForwardingUnit::Producer exMa;
+    };
+
+    Stall check(const Query& q) {
+        if (q.isMatrixOrWait && q.matrixBusy) { ++stats_.matrixBusy; return Stall::MatrixBusy; }
+        if (q.isSerializing && q.exMa.valid) { ++stats_.serialize; return Stall::Serialize; }
+        const Exec::RegUse& u = *q.use;
+        if (q.exMa.memRead && ForwardingUnit::matches(q.exMa, q.exMa.rd) &&
+            ((u.readsA && u.a == q.exMa.rd) || (u.readsB && u.b == q.exMa.rd) || (u.readsC && u.c == q.exMa.rd))) {
+            ++stats_.loadUse;
+            return Stall::LoadUse;
         }
-
-        // 2. Load-Use Hazard Detection
-        const bool loadUseHazard = exMemRead && (exRd != ISA::ZERO) &&
-                                  ((idUse.readsA && idUse.a == exRd) ||
-                                   (idUse.readsB && idUse.b == exRd) ||
-                                   (idUse.readsC && idUse.c == exRd));
-
-        if (loadUseHazard) {
-            sigs.stallFetch   = true;
-            sigs.stallDecode  = true;
-            sigs.flushExecute = true; // Insert NOP bubble into EX
-        }
-
-        // 3. Structural & Multi-cycle Execution Interlocks
-        if (matrixUnitBusy || aluBusy) {
-            sigs.stallFetch   = true;
-            sigs.stallDecode  = true;
-            sigs.stallExecute = true;
-        }
-
-        return sigs;
+        return Stall::None;
     }
+
+    const Stats& stats() const { return stats_; }
+
+private:
+    Stats stats_;
 };
