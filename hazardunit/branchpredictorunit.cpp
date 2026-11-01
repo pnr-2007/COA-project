@@ -1,94 +1,81 @@
 #pragma once
 
-#include <algorithm>
-#include <array>
-#include <cmath>
+#include <vector>
 #include <cstdint>
+#include <cmath>
+#include <algorithm>
+#include <random>
 
-class RLBranchPredictor {
+class QLearningBranchPredictor {
 public:
-    struct QState {
-        double qNotTaken = 0.0;
-        double qTaken    = 0.0;
+    struct Prediction {
+        bool predictTaken = false;
+        size_t stateIndex = 0;
+        uint8_t actionIndex = 0;
     };
 
-    struct PredictionResult {
-        bool predictedTaken = false;
-        uint64_t targetPC = 0;
-        uint32_t stateHash = 0;
-    };
+    QLearningBranchPredictor(size_t tableSize = 1024, float alpha = 0.1f, float gamma = 0.9f, float epsilon = 0.05f)
+        : tableSize_(tableSize), alpha_(alpha), gamma_(gamma), epsilon_(epsilon), gahr_(0) {
+        
+        // Q-Table initialized to 0.0 for states s, actions a in {0: Not-Taken, 1: Taken}
+        qTable_.resize(tableSize_, std::vector<float>(2, 0.0f));
+        rng_.seed(42);
+    }
 
-    struct RLStats {
-        uint64_t totalBranches  = 0;
-        uint64_t correctPreads  = 0;
-        uint64_t mispredictions = 0;
+    // Evaluates state and generates direction prediction (IF Stage)
+    Prediction predict(uint64_t pc) {
+        Prediction pred;
+        pred.stateIndex = calculateState(pc);
 
-        double accuracy() const {
-            return totalBranches ? (static_cast<double>(correctPreads) / totalBranches) * 100.0 : 0.0;
-        }
-    };
-
-    explicit RLBranchPredictor(double alpha = 0.1, double gamma = 0.95, double epsilon = 0.05)
-        : alpha_(alpha), gamma_(gamma), epsilon_(epsilon) {}
-
-    inline PredictionResult predict(uint64_t pc, int32_t branchImmediate, bool isReturn, uint64_t lrVal) {
-        PredictionResult pred;
-        const uint32_t stateKey = hashState(pc);
-        pred.stateHash = stateKey;
-
-        const QState& state = qTable_[stateKey];
-        pred.predictedTaken = (state.qTaken >= state.qNotTaken);
-
-        if (isReturn) {
-            pred.targetPC = lrVal;
-            pred.predictedTaken = true;
-        } else if (pred.predictedTaken) {
-            pred.targetPC = pc + static_cast<uint64_t>(static_cast<int64_t>(branchImmediate) * 4);
+        // Epsilon-greedy exploration choice
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        if (dist(rng_) < epsilon_) {
+            std::uniform_int_distribution<int> actionDist(0, 1);
+            pred.actionIndex = static_cast<uint8_t>(actionDist(rng_));
         } else {
-            pred.targetPC = pc + 4;
+            // Argmax Q-value selection
+            float qNT = qTable_[pred.stateIndex][0];
+            float qT  = qTable_[pred.stateIndex][1];
+            pred.actionIndex = (qT > qNT) ? 1 : 0;
         }
 
+        pred.predictTaken = (pred.actionIndex == 1);
         return pred;
     }
 
-    inline void update(uint64_t pc, uint32_t stateKey, bool actualTaken, bool predictedTaken) {
-        ++stats_.totalBranches;
+    // Updates Q-table weights based on execution feedback (EX Stage)
+    void update(uint64_t pc, const Prediction& pred, bool actualTaken, uint64_t nextPC) {
+        size_t currentState = pred.stateIndex;
+        uint8_t action = pred.actionIndex;
+        size_t nextState = calculateState(nextPC);
 
-        QState& state = qTable_[stateKey];
-        const bool hit = (actualTaken == predictedTaken);
+        // Reward function evaluation
+        float reward = (actualTaken == pred.predictTaken) ? 1.0f : -1.0f;
 
-        if (hit) ++stats_.correctPreads;
-        else     ++stats_.mispredictions;
+        // Max Q-value for next state: max_a' Q(s', a')
+        float maxNextQ = std::max(qTable_[nextState][0], qTable_[nextState][1]);
 
-        const double reward = hit ? 1.0 : -1.0;
-        const uint8_t nextGhr = ((ghr_ << 1) | (actualTaken ? 1 : 0)) & 0xFF;
-        const uint32_t nextStateKey = (static_cast<uint32_t>(pc >> 2) ^ nextGhr) & TABLE_MASK;
-        const QState& nextState = qTable_[nextStateKey];
-        const double maxNextQ = std::max(nextState.qNotTaken, nextState.qTaken);
+        // Q-Learning Bellman Update Equation
+        float currentQ = qTable_[currentState][action];
+        qTable_[currentState][action] = currentQ + alpha_ * (reward + (gamma_ * maxNextQ) - currentQ);
 
-        if (actualTaken) {
-            state.qTaken += alpha_ * (reward + gamma_ * maxNextQ - state.qTaken);
-        } else {
-            state.qNotTaken += alpha_ * (reward + gamma_ * maxNextQ - state.qNotTaken);
-        }
-
-        ghr_ = nextGhr;
+        // Shift Global Branch History Register (BHR)
+        gahr_ = ((gahr_ << 1) | (actualTaken ? 1 : 0)) & 0x0F;
     }
-
-    const RLStats& stats() const { return stats_; }
 
 private:
-    static constexpr size_t TABLE_SIZE = 256;
-    static constexpr uint32_t TABLE_MASK = TABLE_SIZE - 1;
-
-    inline uint32_t hashState(uint64_t pc) const {
-        return (static_cast<uint32_t>(pc >> 2) ^ ghr_) & TABLE_MASK;
+    size_t calculateState(uint64_t pc) const {
+        // Gshare indexing: PC hash XORed with Global History Register (BHR)
+        uint64_t pcHash = (pc >> 2) & (tableSize_ - 1);
+        return (pcHash ^ gahr_) & (tableSize_ - 1);
     }
 
-    double alpha_;
-    double gamma_;
-    double epsilon_;
-    uint8_t ghr_ = 0;
-    std::array<QState, TABLE_SIZE> qTable_{};
-    RLStats stats_;
+    size_t tableSize_;
+    float alpha_;   // Learning rate
+    float gamma_;   // Discount factor
+    float epsilon_; // Exploration rate
+    uint8_t gahr_;  // 4-bit Global Branch History Register
+
+    std::vector<std::vector<float>> qTable_;
+    std::mt19937 rng_;
 };
