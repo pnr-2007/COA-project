@@ -26,7 +26,7 @@ public:
     static constexpr uint8_t LR   = 14;
     static constexpr uint8_t PC   = 15;
 
-    enum class InstructionType   : uint8_t { ALU, MATRIX, MEMORY, BRANCH, SYSTEM };
+    enum class InstructionType   : uint8_t { ALU, MATRIX, MEMORY, BRANCH, SYSTEM, FP };
     enum class InstructionFormat : uint8_t { R_TYPE, I_TYPE, B_TYPE, J_TYPE, M_TYPE };
 
     enum class Opcode : uint8_t {
@@ -35,7 +35,8 @@ public:
         MATMUL, MATADD, MATDETERMINANT,
         LOAD, STORE,
         JEQ, JGT, JZ, JNZ, JMP, CALL, RET,
-        NOP, HALT, MATWAIT,
+        NOP, HALT, MATWAIT, RDSR, WRSR, RETI,
+        FADD, FSUB, FMUL, FDIV, FSQRT, FCMP, FCVTDQ, FCVTQD, FMVDX, FMVXD, FLOAD, FSTORE,
         OPCODE_COUNT
     };
 
@@ -91,7 +92,23 @@ public:
             // SYSTEM
             {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "NOP", false},
             {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "HALT", false},
-            {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "MATWAIT", false}
+            {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "MATWAIT", false},
+            {InstructionFormat::I_TYPE, InstructionType::SYSTEM, "RDSR", false},
+            {InstructionFormat::I_TYPE, InstructionType::SYSTEM, "WRSR", false},
+            {InstructionFormat::R_TYPE, InstructionType::SYSTEM, "RETI", false},
+            // FP
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FADD", false},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FSUB", false},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FMUL", false},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FDIV", false},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FSQRT", true},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FCMP", false},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FCVTDQ", true},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FCVTQD", true},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FMVDX", true},
+            {InstructionFormat::R_TYPE, InstructionType::FP, "FMVXD", true},
+            {InstructionFormat::I_TYPE, InstructionType::MEMORY, "FLOAD", false},
+            {InstructionFormat::I_TYPE, InstructionType::MEMORY, "FSTORE", false}
         };
         return table[opcodeValue(op)];
     }
@@ -246,4 +263,3 @@ static_assert(ISA::MAX_MATRIX_ROWS == ISA::MAX_MATRIX_COLS, "MATMUL packing assu
 static_assert(static_cast<uint32_t>(ISA::MAX_MATRIX_ROWS) * ISA::MAX_MATRIX_ROWS * ISA::MAX_MATRIX_ROWS <= (1u << 13),
               "MATMUL packed dimensions must fit in 13 bits");
 static_assert((1u << ISA::OPCODE_BITS) >= ISA::opcodeValue(ISA::Opcode::OPCODE_COUNT), "");
-
