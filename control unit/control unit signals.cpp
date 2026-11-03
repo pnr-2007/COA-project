@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include "exec.cpp"
@@ -6,7 +5,7 @@
 #include <cstdint>
 
 enum class AluOp : uint8_t { NONE, ADD, SUB, MUL, DIV, MOD, AND, OR, XOR, NOT, LSL, LSR, ASR, SIN, COS, LOG, CMP };
-enum class ResultSel : uint8_t { NONE, ALU, LOAD, LINK, SPECIAL };
+enum class ResultSel : uint8_t { NONE, ALU, LOAD, LINK, SPECIAL, FPU };
 enum class BranchKind : uint8_t { NONE, JEQ, JGT, JZ, JNZ, JMP, CALL, RET, RETI };
 
 struct ControlWord {
@@ -16,11 +15,15 @@ struct ControlWord {
     ISA::Opcode opcode = ISA::Opcode::NOP;
 
     bool readsA = false, readsB = false, readsC = false, immB = false;
+    bool srcAFp = false, srcBFp = false, destFp = false;
     uint8_t srcA = 0, srcB = 0, srcC = 0;
     int32_t immediate = 0;
 
     AluOp alu = AluOp::NONE;
     bool longOp = false;
+
+    bool fpOp = false, fpRounds = false;
+    FPU::Op fpKind = FPU::Op::ADD;
 
     bool regWrite = false;
     uint8_t dest = 0;
@@ -41,13 +44,14 @@ struct ControlWord {
 };
 
 struct ExMaControl {
+    bool destFp = false;
     bool valid = false, regWrite = false, memRead = false, memWrite = false, halt = false, matrixOp = false;
     uint8_t rd = 0;
     Exec::Fault fault = Exec::Fault::None;
 };
 
 struct MaRwControl {
-    bool valid = false, regWrite = false, halt = false;
+    bool valid = false, regWrite = false, halt = false, destFp = false;
     uint8_t rd = 0;
     Exec::Fault fault = Exec::Fault::None;
 };
@@ -85,6 +89,7 @@ public:
             case ISA::InstructionType::BRANCH: decodeBranch(f, w); break;
             case ISA::InstructionType::MATRIX: decodeMatrix(f, w); break;
             case ISA::InstructionType::SYSTEM: decodeSystem(f, w); break;
+            case ISA::InstructionType::FP:     decodeFp(f, w); break;
         }
         return w;
     }
@@ -107,11 +112,14 @@ public:
             if (f.opcode == ISA::Opcode::MATDETERMINANT && f.matrixRows != f.matrixCols) return Fault::IllegalInstruction;
         }
         if (f.opcode == ISA::Opcode::EXP || f.opcode == ISA::Opcode::POW) return Fault::IllegalInstruction;
-        if ((f.opcode == ISA::Opcode::LOAD || f.opcode == ISA::Opcode::STORE) && f.modifier != 0) return Fault::IllegalInstruction;
+        if ((f.opcode == ISA::Opcode::LOAD || f.opcode == ISA::Opcode::STORE || f.opcode == ISA::Opcode::FLOAD ||
+             f.opcode == ISA::Opcode::FSTORE) && f.modifier != 0)
+            return Fault::IllegalInstruction;
+        if (f.type() == ISA::InstructionType::FP && !ISA::isUnary(f.opcode) && f.modifier != 0) return Fault::IllegalInstruction;
         if ((f.opcode == ISA::Opcode::RDSR || f.opcode == ISA::Opcode::WRSR) && !ExceptionHandler::validSelect(f.immediate))
             return Fault::IllegalInstruction;
         const ControlWord w = decode(f);
-        if (w.regWrite && w.dest == ISA::PC) return Fault::IllegalInstruction;
+        if (w.regWrite && !w.destFp && w.dest == ISA::PC) return Fault::IllegalInstruction;
         return Fault::None;
     }
 
@@ -139,6 +147,7 @@ public:
         e.halt = w.halt;
         e.matrixOp = w.matrixOp;
         e.rd = w.dest;
+        e.destFp = w.destFp;
         e.fault = w.fault;
         return e;
     }
@@ -149,6 +158,7 @@ public:
         m.regWrite = e.regWrite;
         m.halt = e.halt;
         m.rd = e.rd;
+        m.destFp = e.destFp;
         m.fault = e.fault;
         return m;
     }
@@ -204,15 +214,41 @@ private:
     static void decodeMemory(const ISA::InstructionFields& f, ControlWord& w) {
         w.readsA = true;
         w.srcA = f.rs1;
-        if (f.opcode == Op::LOAD) {
+        if (f.opcode == Op::LOAD || f.opcode == Op::FLOAD) {
             w.memRead = true;
             w.regWrite = true;
             w.dest = f.rd;
+            w.destFp = f.opcode == Op::FLOAD;
             w.result = ResultSel::LOAD;
         } else {
             w.memWrite = true;
             w.readsB = true;
             w.srcB = f.rd;
+            w.srcBFp = f.opcode == Op::FSTORE;
+        }
+    }
+
+    static void decodeFp(const ISA::InstructionFields& f, ControlWord& w) {
+        w.fpOp = true;
+        w.fpKind = Exec::fpOpOf(f.opcode);
+        w.fpRounds = FPU::usesRounding(w.fpKind);
+        w.readsA = true;
+        w.srcA = f.rs1;
+        w.srcAFp = true;
+        w.regWrite = true;
+        w.dest = f.rd;
+        w.destFp = true;
+        w.result = ResultSel::FPU;
+        switch (f.opcode) {
+            case Op::FADD: case Op::FSUB: case Op::FMUL: case Op::FDIV:
+                w.readsB = true; w.srcB = f.rs2; w.srcBFp = true; break;
+            case Op::FCMP:
+                w.readsB = true; w.srcB = f.rs2; w.srcBFp = true; w.destFp = false; break;
+            case Op::FCVTQD: case Op::FMVXD:
+                w.destFp = false; break;
+            case Op::FCVTDQ: case Op::FMVDX:
+                w.srcAFp = false; break;
+            default: break;
         }
     }
 
