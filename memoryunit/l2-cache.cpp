@@ -1,139 +1,184 @@
 #pragma once
 
-#include "main_memory.hpp"
-#include <vector>
-#include <cmath>
+#include "main_memory.cpp"
 #include <cstdint>
+#include <stdexcept>
+#include <vector>
 
 class L2Cache {
 public:
+    struct Stats {
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t writebacks = 0;
+        double hitRate() const { return (hits + misses) ? double(hits) / double(hits + misses) : 0.0; }
+    };
+
+    L2Cache(size_t sizeBytes, size_t lineBytes, size_t ways, uint32_t hitLatency, MainMemory& ram) : ways_(ways), lineBytes_(lineBytes), hitLatency_(hitLatency), ram_(ram) {
+        if (!pow2(lineBytes) || lineBytes < 8 || !pow2(ways) || sizeBytes % (lineBytes * ways) != 0)
+            throw std::invalid_argument("Cache: line size and ways must be powers of two and divide the size");
+        numSets_ = sizeBytes / (lineBytes * ways);
+        if (!pow2(numSets_)) throw std::invalid_argument("Cache: number of sets must be a power of two");
+        offsetBits_ = log2u(lineBytes);
+        indexBits_  = log2u(numSets_);
+        sets_.assign(numSets_, std::vector<Line>(ways, Line(lineBytes / 8)));
+        plru_.assign(numSets_, std::vector<uint8_t>(ways > 1 ? ways - 1 : 0, 0));
+    }
+
+    const Stats& stats() const { return stats_; }
+
     struct Response {
-        uint64_t data = 0;
         bool hit = false;
         uint32_t stallCycles = 0;
     };
 
-    struct TagEntry {
-        bool valid = false;
-        bool dirty = false;
-        uint64_t tag = 0;
-    };
+    size_t lineBytes() const { return lineBytes_; }
 
-    struct DataBlock {
-        std::vector<uint64_t> words;
-        explicit DataBlock(size_t wordsPerLine = 8) : words(wordsPerLine, 0) {}
-    };
-
-    L2Cache(size_t sizeBytes, size_t lineSizeBytes, size_t ways, uint32_t l2HitLatency, MainMemory& ram)
-        : ways_(ways), l2HitLatency_(l2HitLatency), lineSize_(lineSizeBytes), ram_(ram) {
-        
-        numSets_ = (sizeBytes / lineSizeBytes) / ways;
-        tagArray_.resize(numSets_, std::vector<TagEntry>(ways));
-        dataArray_.resize(numSets_, std::vector<DataBlock>(ways, DataBlock(lineSizeBytes / 8)));
-        
-        // 7 tree bits per set for 8-way L2 cache
-        plruTrees_.resize(numSets_, std::vector<uint8_t>(ways - 1, 0));
+    void invalidateRange(uint64_t base, uint64_t bytes) {
+        forEachLine(base, bytes, [&](size_t set, size_t way, uint64_t) { sets_[set][way].valid = false; sets_[set][way].dirty = false; });
     }
 
-    Response access(uint64_t physAddr, bool isWrite, uint64_t writeData) {
+
+    Response accessLine(uint64_t addr, bool isWrite, std::vector<uint64_t>& words) {
         Response resp;
-        const uint64_t offsetBits = static_cast<uint64_t>(std::log2(lineSize_));
-        const uint64_t indexBits = static_cast<uint64_t>(std::log2(numSets_));
-        
-        const uint64_t index = (physAddr >> offsetBits) & (numSets_ - 1);
-        const uint64_t tag = physAddr >> (offsetBits + indexBits);
-        const uint64_t wordOffset = (physAddr & (lineSize_ - 1)) >> 3;
-
-        // Tag Check
-        int hitWay = -1;
-        for (size_t way = 0; way < ways_; ++way) {
-            if (tagArray_[index][way].valid && tagArray_[index][way].tag == tag) {
-                hitWay = static_cast<int>(way);
-                break;
-            }
-        }
-
-        if (hitWay != -1) {
+        const uint64_t set = setIndex(addr), tag = tagOf(addr);
+        int way = find(set, tag);
+        if (way >= 0) {
+            ++stats_.hits;
             resp.hit = true;
-            resp.stallCycles = l2HitLatency_;
-
-            if (isWrite) {
-                dataArray_[index][hitWay].words[wordOffset] = writeData;
-                tagArray_[index][hitWay].dirty = true;
-            } else {
-                resp.data = dataArray_[index][hitWay].words[wordOffset];
-            }
-
-            updatePLRUTree(index, static_cast<size_t>(hitWay));
-            return resp;
-        }
-
-        // L2 Miss -> Use Tree-PLRU to pick victim line
-        resp.hit = false;
-        resp.stallCycles = l2HitLatency_ + ram_.latency();
-
-        size_t victimWay = getVictimWayPLRU(index);
-        TagEntry& victimTag = tagArray_[index][victimWay];
-        DataBlock& victimData = dataArray_[index][victimWay];
-
-        if (victimTag.valid && victimTag.dirty) {
-            uint64_t victimAddr = (victimTag.tag << (offsetBits + indexBits)) | (index << offsetBits);
-            for (size_t i = 0; i < victimData.words.size(); ++i) {
-                ram_.writeWord(victimAddr + (i * 8), victimData.words[i]);
-            }
-        }
-
-        uint64_t lineBaseAddr = physAddr & ~(lineSize_ - 1);
-        for (size_t i = 0; i < victimData.words.size(); ++i) {
-            victimData.words[i] = ram_.readWord(lineBaseAddr + (i * 8));
-        }
-
-        victimTag.valid = true;
-        victimTag.dirty = isWrite;
-        victimTag.tag = tag;
-        updatePLRUTree(index, victimWay);
-
-        if (isWrite) {
-            victimData.words[wordOffset] = writeData;
+            resp.stallCycles = hitLatency_;
         } else {
-            resp.data = victimData.words[wordOffset];
+            ++stats_.misses;
+            resp.stallCycles = hitLatency_ + (isWrite ? 0 : ram_.latency());
+            way = static_cast<int>(victim(set));
+            Line& v = sets_[set][way];
+            if (v.valid && v.dirty) {
+                const uint64_t va = lineAddress(set, v.tag);
+                for (size_t i = 0; i < v.words.size(); ++i) ram_.writeWord(va + i * 8, v.words[i]);
+                ++stats_.writebacks;
+            }
+            const uint64_t base = lineBase(addr);
+            if (!isWrite)
+                for (size_t i = 0; i < v.words.size(); ++i) v.words[i] = ram_.readWord(base + i * 8);
+            v.valid = true;
+            v.dirty = false;
+            v.tag = tag;
         }
-
+        Line& l = sets_[set][way];
+        if (isWrite) { l.words = words; l.dirty = true; }
+        else         { words = l.words; }
+        touch(set, static_cast<size_t>(way));
         return resp;
     }
 
-private:
-    size_t getVictimWayPLRU(size_t setIndex) const {
-        for (size_t way = 0; way < ways_; ++way) {
-            if (!tagArray_[setIndex][way].valid) return way;
-        }
+    bool contains(uint64_t addr) const { return find(setIndex(addr), tagOf(addr)) >= 0; }
 
+    bool peekWord(uint64_t addr, uint64_t& v) const {
+        const uint64_t set = setIndex(addr);
+        const int w = find(set, tagOf(addr));
+        if (w < 0) return false;
+        v = sets_[set][w].words[wordOffset(addr)];
+        return true;
+    }
+
+    bool pokeWord(uint64_t addr, uint64_t v) {
+        const uint64_t set = setIndex(addr);
+        const int w = find(set, tagOf(addr));
+        if (w < 0) return false;
+        sets_[set][w].words[wordOffset(addr)] = v;
+        sets_[set][w].dirty = true;
+        return true;
+    }
+
+    uint32_t writebackRange(uint64_t base, uint64_t bytes) {
+        return writebackRangeTo(base, bytes, [&](uint64_t a, const std::vector<uint64_t>& w) {
+            for (size_t i = 0; i < w.size(); ++i) ram_.writeWord(a + i * 8, w[i]);
+        });
+    }
+
+    uint32_t flushAll() {
+        return flushAllTo([&](uint64_t a, const std::vector<uint64_t>& w) {
+            for (size_t i = 0; i < w.size(); ++i) ram_.writeWord(a + i * 8, w[i]);
+        });
+    }
+
+private:
+    struct Line {
+        bool valid = false, dirty = false;
+        uint64_t tag = 0;
+        std::vector<uint64_t> words;
+        explicit Line(size_t n = 8) : words(n, 0) {}
+    };
+
+    static bool pow2(size_t v) { return v && (v & (v - 1)) == 0; }
+    static unsigned log2u(size_t v) { unsigned n = 0; while (v > 1) { v >>= 1; ++n; } return n; }
+
+    uint64_t setIndex(uint64_t a) const { return (a >> offsetBits_) & (numSets_ - 1); }
+    uint64_t tagOf(uint64_t a) const { return a >> (offsetBits_ + indexBits_); }
+    uint64_t wordOffset(uint64_t a) const { return (a & (lineBytes_ - 1)) >> 3; }
+    uint64_t lineBase(uint64_t a) const { return a & ~uint64_t(lineBytes_ - 1); }
+    uint64_t lineAddress(uint64_t set, uint64_t tag) const { return (tag << (offsetBits_ + indexBits_)) | (set << offsetBits_); }
+
+    int find(uint64_t set, uint64_t tag) const {
+        for (size_t w = 0; w < ways_; ++w)
+            if (sets_[set][w].valid && sets_[set][w].tag == tag) return static_cast<int>(w);
+        return -1;
+    }
+
+    size_t victim(uint64_t set) const {
+        for (size_t w = 0; w < ways_; ++w)
+            if (!sets_[set][w].valid) return w;
         size_t node = 0;
-        size_t levels = static_cast<size_t>(std::log2(ways_));
-        for (size_t lvl = 0; lvl < levels; ++lvl) {
-            uint8_t direction = plruTrees_[setIndex][node];
-            node = 2 * node + 1 + direction;
-        }
+        for (unsigned l = 0; l < log2u(ways_); ++l) node = 2 * node + 1 + plru_[set][node];
         return node - (ways_ - 1);
     }
 
-    void updatePLRUTree(size_t setIndex, size_t accessedWay) {
-        size_t node = (ways_ - 1) + accessedWay;
+    void touch(uint64_t set, size_t way) {
+        size_t node = (ways_ - 1) + way;
         while (node > 0) {
-            size_t parent = (node - 1) / 2;
-            bool isRightChild = (node % 2 == 0);
-            plruTrees_[setIndex][parent] = isRightChild ? 0 : 1;
+            const size_t parent = (node - 1) / 2;
+            plru_[set][parent] = (node % 2 == 0) ? 0 : 1;
             node = parent;
         }
     }
 
-    size_t numSets_;
-    size_t ways_;
-    uint32_t l2HitLatency_;
-    size_t lineSize_;
-    MainMemory& ram_;
+    template <class F>
+    void forEachLine(uint64_t base, uint64_t bytes, F&& f) {
+        if (bytes == 0) return;
+        const uint64_t last = lineBase(base + bytes - 1);
+        for (uint64_t a = lineBase(base); a <= last; a += lineBytes_) {
+            const uint64_t set = setIndex(a);
+            const int w = find(set, tagOf(a));
+            if (w >= 0) f(static_cast<size_t>(set), static_cast<size_t>(w), a);
+        }
+    }
 
-    std::vector<std::vector<TagEntry>>  tagArray_;
-    std::vector<std::vector<DataBlock>> dataArray_;
-    std::vector<std::vector<uint8_t>>   plruTrees_;
+    template <class Sink>
+    uint32_t writebackRangeTo(uint64_t base, uint64_t bytes, Sink&& sink) {
+        uint32_t n = 0;
+        forEachLine(base, bytes, [&](size_t set, size_t way, uint64_t addr) {
+            Line& l = sets_[set][way];
+            if (l.valid && l.dirty) { sink(addr, l.words); l.dirty = false; ++n; ++stats_.writebacks; }
+        });
+        return n;
+    }
+
+    template <class Sink>
+    uint32_t flushAllTo(Sink&& sink) {
+        uint32_t n = 0;
+        for (size_t s = 0; s < numSets_; ++s)
+            for (size_t w = 0; w < ways_; ++w) {
+                Line& l = sets_[s][w];
+                if (l.valid && l.dirty) { sink(lineAddress(s, l.tag), l.words); l.dirty = false; ++n; ++stats_.writebacks; }
+            }
+        return n;
+    }
+
+    size_t numSets_ = 0, ways_, lineBytes_;
+    unsigned offsetBits_ = 0, indexBits_ = 0;
+    std::vector<std::vector<Line>> sets_;
+    std::vector<std::vector<uint8_t>> plru_;
+    Stats stats_;
+    uint32_t hitLatency_;
+    MainMemory& ram_;
 };
