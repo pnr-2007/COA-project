@@ -25,8 +25,10 @@ public:
         if (q.isMatrixOrWait && q.matrixBusy) { ++stats_.matrixBusy; return Stall::MatrixBusy; }
         if (q.isSerializing && q.exMa.valid) { ++stats_.serialize; return Stall::Serialize; }
         const Exec::RegUse& u = *q.use;
-        if (q.exMa.memRead && ForwardingUnit::matches(q.exMa, q.exMa.rd) &&
-            ((u.readsA && u.a == q.exMa.rd) || (u.readsB && u.b == q.exMa.rd) || (u.readsC && u.c == q.exMa.rd))) {
+        const ForwardingUnit::Producer& p = q.exMa;
+        if (p.memRead && ForwardingUnit::matches(p, p.rd, p.fp) &&
+            ((u.readsA && u.a == p.rd && u.aFp == p.fp) || (u.readsB && u.b == p.rd && u.bFp == p.fp) ||
+             (u.readsC && u.c == p.rd && !p.fp))) {
             ++stats_.loadUse;
             return Stall::LoadUse;
         }
