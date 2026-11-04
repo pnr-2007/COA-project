@@ -69,10 +69,6 @@ public:
         return resp;
     }
 
-    uint32_t writebackRange(uint64_t base, uint64_t bytes) {
-        return writebackRangeTo(base, bytes, [&](uint64_t a, std::vector<uint64_t>& w) { l2_.accessLine(a, true, w); });
-    }
-
     uint32_t flushAll() {
         return flushAllTo([&](uint64_t a, std::vector<uint64_t>& w) { l2_.accessLine(a, true, w); });
     }
@@ -129,16 +125,6 @@ private:
     }
 
     template <class Sink>
-    uint32_t writebackRangeTo(uint64_t base, uint64_t bytes, Sink&& sink) {
-        uint32_t n = 0;
-        forEachLine(base, bytes, [&](size_t set, size_t way, uint64_t addr) {
-            Line& l = sets_[set][way];
-            if (l.valid && l.dirty) { sink(addr, l.words); l.dirty = false; ++n; ++stats_.writebacks; }
-        });
-        return n;
-    }
-
-    template <class Sink>
     uint32_t flushAllTo(Sink&& sink) {
         uint32_t n = 0;
         for (size_t s = 0; s < numSets_; ++s)
@@ -163,4 +149,4 @@ struct L1Subsystem {
     L1Cache dCache;
     L1Subsystem(size_t iBytes, size_t dBytes, size_t lineBytes, size_t ways, uint32_t hitLatency, L2Cache& l2)
         : iCache(iBytes, lineBytes, ways, hitLatency, l2), dCache(dBytes, lineBytes, ways, hitLatency, l2) {}
-};
+};;
