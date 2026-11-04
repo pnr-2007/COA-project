@@ -1,20 +1,17 @@
 #pragma once
 
-#include "forwarding_unit.hpp"
-#include "branch_predictor.hpp"
-#include "interlock_unit.hpp"
-#include "interrupt_handler.hpp"
-#include "exception_handler.hpp"
+#include "forwarding_unit.cpp"
+#include "interlock_unit.cpp"
+#include "branch_predictor.cpp"
+#include "interrupt_handler.cpp"
 
-class UnifiedHazardUnit {
+class HazardUnit {
 public:
-    ForwardingUnit   forwarding;
-    RLBranchPredictor predictor;
-    InterlockUnit    interlock;
-    InterruptHandler interruptHandler;
-    ExceptionHandler exceptionHandler;
+    explicit HazardUnit(const RLBranchPredictor::Config& predictor) : predictor(predictor) {}
 
-    void reset() {
-        exceptionHandler.clear();
-    }
+    ForwardingUnit    forwarding;
+    InterlockUnit     interlock;
+    RLBranchPredictor predictor;
+    ReturnStack       returnStack;
+    InterruptHandler interrupts;
 };
