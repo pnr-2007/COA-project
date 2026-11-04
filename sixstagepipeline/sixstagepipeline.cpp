@@ -7,6 +7,10 @@
 #include "forwarding_unit.cpp"
 #include "interlock_unit.cpp"
 #include "branch_predictor.cpp"
+#include "l1_cache.cpp"
+#include "l2_cache.cpp"
+#include "main_memory subsytem.cpp"
+#include "control_unit.cpp"
 #include "microprogrammed_control_unit.cpp"
 #include <stdexcept>
 #include <vector>
