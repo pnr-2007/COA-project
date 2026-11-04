@@ -1,31 +1,29 @@
 #pragma once
 
-#include "trap_state.cpp"
+#include "exception_handler.cpp"
 
-class InterruptHandler {
+class InterruptHandler : public ExceptionHandler {
 public:
-    using Word = TrapState::Word;
-
     static constexpr Word     CAUSE_BASE  = 16;
     static constexpr unsigned VECTOR_BASE = 4;
 
-    static void raise(TrapState& t, unsigned line) {
-        if (line < TrapState::INTERRUPT_LINES) t.set(TrapState::IPEND, t.read(TrapState::IPEND) | (Word(1) << line));
+    void raise(unsigned line) {
+        if (line < INTERRUPT_LINES) sr_[IPEND] |= Word(1) << line;
     }
 
-    static int pending(const TrapState& t) {
-        if (!(t.read(TrapState::STATUS) & TrapState::STATUS_IE) || t.inTrap() || !t.handlerInstalled()) return -1;
-        const Word p = t.read(TrapState::IPEND) & t.read(TrapState::IMASK);
-        for (unsigned i = 0; i < TrapState::INTERRUPT_LINES; ++i)
+    int pendingInterrupt() const {
+        if (!(sr_[STATUS] & STATUS_IE) || inTrap() || !handlerInstalled()) return -1;
+        const Word p = sr_[IPEND] & sr_[IMASK];
+        for (unsigned i = 0; i < INTERRUPT_LINES; ++i)
             if (p & (Word(1) << i)) return static_cast<int>(i);
         return -1;
     }
 
-    static Word enter(TrapState& t, unsigned line, Word nextPc) {
-        t.set(TrapState::IPEND, t.read(TrapState::IPEND) & ~(Word(1) << line));
-        t.set(TrapState::EPC, nextPc);
-        t.set(TrapState::CAUSE, CAUSE_BASE + line);
-        t.beginTrap();
-        return t.read(TrapState::TVEC) + TrapState::VECTOR_STRIDE * (VECTOR_BASE + line);
+    Word enterInterrupt(unsigned line, Word nextPc) {
+        sr_[IPEND] &= ~(Word(1) << line);
+        sr_[EPC]   = nextPc;
+        sr_[CAUSE] = CAUSE_BASE + line;
+        beginTrap();
+        return sr_[TVEC] + VECTOR_STRIDE * (VECTOR_BASE + line);
     }
 };
