@@ -71,31 +71,6 @@ public:
         return resp;
     }
 
-    bool contains(uint64_t addr) const { return find(setIndex(addr), tagOf(addr)) >= 0; }
-
-    bool peekWord(uint64_t addr, uint64_t& v) const {
-        const uint64_t set = setIndex(addr);
-        const int w = find(set, tagOf(addr));
-        if (w < 0) return false;
-        v = sets_[set][w].words[wordOffset(addr)];
-        return true;
-    }
-
-    bool pokeWord(uint64_t addr, uint64_t v) {
-        const uint64_t set = setIndex(addr);
-        const int w = find(set, tagOf(addr));
-        if (w < 0) return false;
-        sets_[set][w].words[wordOffset(addr)] = v;
-        sets_[set][w].dirty = true;
-        return true;
-    }
-
-    uint32_t writebackRange(uint64_t base, uint64_t bytes) {
-        return writebackRangeTo(base, bytes, [&](uint64_t a, const std::vector<uint64_t>& w) {
-            for (size_t i = 0; i < w.size(); ++i) ram_.writeWord(a + i * 8, w[i]);
-        });
-    }
-
     uint32_t flushAll() {
         return flushAllTo([&](uint64_t a, const std::vector<uint64_t>& w) {
             for (size_t i = 0; i < w.size(); ++i) ram_.writeWord(a + i * 8, w[i]);
@@ -151,16 +126,6 @@ private:
             const int w = find(set, tagOf(a));
             if (w >= 0) f(static_cast<size_t>(set), static_cast<size_t>(w), a);
         }
-    }
-
-    template <class Sink>
-    uint32_t writebackRangeTo(uint64_t base, uint64_t bytes, Sink&& sink) {
-        uint32_t n = 0;
-        forEachLine(base, bytes, [&](size_t set, size_t way, uint64_t addr) {
-            Line& l = sets_[set][way];
-            if (l.valid && l.dirty) { sink(addr, l.words); l.dirty = false; ++n; ++stats_.writebacks; }
-        });
-        return n;
     }
 
     template <class Sink>
