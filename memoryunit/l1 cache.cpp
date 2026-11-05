@@ -149,4 +149,4 @@ struct L1Subsystem {
     L1Cache dCache;
     L1Subsystem(size_t iBytes, size_t dBytes, size_t lineBytes, size_t ways, uint32_t hitLatency, L2Cache& l2)
         : iCache(iBytes, lineBytes, ways, hitLatency, l2), dCache(dBytes, lineBytes, ways, hitLatency, l2) {}
-};;
+};
