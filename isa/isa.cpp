@@ -201,4 +201,10 @@ private:
         uint32_t signBit = 1u << (bits - 1);
         return static_cast<int32_t>((value ^ signBit) - signBit);
     }
-}
+};
+
+static_assert((1u << ISA::REGISTER_BITS) == ISA::REGISTER_COUNT, "");
+static_assert((1u << ISA::OPCODE_BITS) >= ISA::opcodeValue(ISA::Opcode::OPCODE_COUNT), "");
+
+
+
