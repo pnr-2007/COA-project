@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include "exec.cpp"
@@ -44,7 +43,6 @@ public:
         };
         const Word a = u.readsA ? readReg(u.a, u.aFp) : 0;
         const Word b = u.readsB ? readReg(u.b, u.bFp) : 0;
-        const Word c = u.readsC ? readReg(u.c, false) : 0;
 
         uint64_t next  = pc_ + 4;
         Word     value = 0;
@@ -53,7 +51,9 @@ public:
         switch (f.type()) {
             case ISA::InstructionType::ALU: {
                 const Word second = f.modifier ? static_cast<Word>(static_cast<int64_t>(f.immediate)) : b;
-                Exec::alu(f.opcode, a, second, value);
+                uint8_t aluFl = 0;
+                Exec::alu(f.opcode, a, second, value, aluFl);
+                trap_.setStatusBits(aluFl);
                 break;
             }
             case ISA::InstructionType::MEMORY: {
@@ -78,24 +78,6 @@ public:
                          : pc_ + static_cast<Word>(static_cast<int64_t>(f.immediate) * 4);
                 }
                 if (f.opcode == ISA::Opcode::CALL) value = pc_ + 4;
-                break;
-            }
-            case ISA::InstructionType::MATRIX: {
-                unsigned aw = 0, bw = 0, ow = 0;
-                Exec::matrixWords(f, aw, bw, ow);
-                if (!Exec::regionOk(a, aw, dmemBytes_) || (bw && !Exec::regionOk(b, bw, dmemBytes_)) ||
-                    !Exec::regionOk(c, ow, dmemBytes_))
-                    return stop(Fault::MemoryFault, c);
-
-                const bool mul = f.opcode == ISA::Opcode::MATMUL;
-                ALU::Matrix A(static_cast<uint8_t>(f.matrixRows), static_cast<uint8_t>(mul ? f.matrixInner : f.matrixCols));
-                ALU::Matrix B(static_cast<uint8_t>(mul ? f.matrixInner : f.matrixRows), static_cast<uint8_t>(f.matrixCols));
-                for (unsigned e = 0; e < aw; ++e) A.data[e] = dmem_[(a >> 3) + e];
-                for (unsigned e = 0; e < bw; ++e) B.data[e] = dmem_[(b >> 3) + e];
-
-                const ALU::MatrixResult r = ALU::executeMatrixOp(f, A, B);
-                for (unsigned e = 0; e < ow; ++e) dmem_[(c >> 3) + e] = r.hasScalar ? r.scalar : r.matrix.data[e];
-                if (r.overflow) trap_.setStatusBits(ExceptionHandler::STATUS_OVERFLOW);
                 break;
             }
             case ISA::InstructionType::SYSTEM:
@@ -158,4 +140,4 @@ private:
     bool     halted_ = false;
     Fault    fault_ = Fault::None;
     uint64_t retired_ = 0;
-}
+};
