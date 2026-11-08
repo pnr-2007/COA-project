@@ -4,7 +4,7 @@
 #include "exception_handler.cpp"
 #include <cstdint>
 
-enum class AluOp : uint8_t { NONE, ADD, SUB, MUL, DIV, MOD, AND, OR, XOR, NOT, LSL, LSR, ASR, SIN, COS, LOG, CMP };
+enum class AluOp : uint8_t { NONE, ADD, SUB, MUL, DIV, MOD, AND, OR, XOR, NOT, LSL, LSR, ASR, SIN, COS, LOG, CMP, EXP, POW };
 enum class ResultSel : uint8_t { NONE, ALU, LOAD, LINK, SPECIAL, FPU };
 enum class BranchKind : uint8_t { NONE, JEQ, JGT, JZ, JNZ, JMP, CALL, RET, RETI };
 
@@ -101,7 +101,6 @@ public:
     }
 
     static Fault validate(const ISA::InstructionFields& f) {
-        if (f.opcode == ISA::Opcode::EXP || f.opcode == ISA::Opcode::POW) return Fault::IllegalInstruction;
         if ((f.opcode == ISA::Opcode::LOAD || f.opcode == ISA::Opcode::STORE || f.opcode == ISA::Opcode::FLOAD ||
              f.opcode == ISA::Opcode::FSTORE) && f.modifier != 0)
             return Fault::IllegalInstruction;
@@ -180,6 +179,8 @@ private:
             case Op::SIN: return AluOp::SIN;
             case Op::COS: return AluOp::COS;
             case Op::LOG: return AluOp::LOG;
+            case Op::EXP: return AluOp::EXP;
+            case Op::POW: return AluOp::POW;
             case Op::CMP: return AluOp::CMP;
             default:      return AluOp::NONE;
         }
