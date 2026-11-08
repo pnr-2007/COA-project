@@ -1,312 +1,322 @@
-#include "isa.cpp"
-#include <algorithm>
-#include <cctype>
-#include <cstdint>
-#include <iomanip>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <vector>
+#pragma once
+
+// Two-pass assembler: RISC201 assembly -> instruction words + initial data (assignment 2a).
+//
+//   Pass 1  walks every line, tracks the text/data location counters and records labels and .equ.
+//   Pass 2  encodes each instruction, resolving forward references.
+//
+// Syntax
+//   label:  OP operands          ; comment  (also '#' and '//')
+//   registers  R0..R15 SP(R13) LR(R14) PC(R15)    FP registers F0..F15
+//   immediates decimal, 0x.., 0b.., 'c', symbols, symbol+const / symbol-const
+//   LOAD/STORE rd, imm(rs1)   (imm optional;  `LOAD R1, label` means label(R0))
+//   branch target: a label (assembler computes the offset) or a plain number (offset in instructions)
+//   .text / .data           select section (default .text)
+//   .word v[, v...]         64-bit data words      .space n   n zero words
+//   .equ NAME, value        constant               .stack n   stack size in bytes (multiple of 8)
+
+#include "asm_syntax.cpp"
+#include "stack_macros.cpp"
+#include "exec.cpp"
+#include <map>
+#include <set>
+
+struct AsmError : std::runtime_error { using std::runtime_error::runtime_error; };
+
+struct Program {
+    struct Line { int srcLine = 0; std::string text, origin; };
+    std::vector<ISA::InstrWord> text;
+    std::vector<ISA::Word>      data;                 // initial data memory from address 0
+    std::vector<Line>           lines;                // one per instruction (source mapping)
+    std::map<std::string, uint64_t> symbols;          // labels and .equ constants
+    std::map<uint64_t, std::string> textLabels;       // address -> label (instruction space)
+    std::map<uint64_t, std::string> dataLabels;       // address -> label (data space)
+    uint64_t stackBytes = 0;                          // 0 = not specified
+};
 
 class Assembler {
 public:
-    struct AssemblyResult {
-        std::vector<ISA::InstrWord> words;
-        std::vector<std::string> errors;
-        bool success = false;
-    };
+    static Program assemble(const std::string& source) {
+        std::vector<SourceLine> lines;
+        std::istringstream in(source);
+        std::string l; int n = 0;
+        while (std::getline(in, l)) { if (!l.empty() && l.back() == '\r') l.pop_back(); lines.push_back({++n, l, ""}); }
+        return assemble(lines);
+    }
 
-    static AssemblyResult assemble(const std::string& source) {
-        AssemblyResult result;
-        std::unordered_map<std::string, uint64_t> labels;
-        std::vector<ParsedLine> parsedLines;
-
-        std::istringstream stream(source);
-        std::string line;
-        uint64_t currentPc = 0;
-
-        while (std::getline(stream, line)) {
-            std::string cleaned = stripComments(line);
-            cleaned = trim(cleaned);
-            if (cleaned.empty()) continue;
-
-            size_t colonPos = cleaned.find(':');
-            while (colonPos != std::string::npos) {
-                std::string labelName = trim(cleaned.substr(0, colonPos));
-                if (labelName.empty() || !isValidLabelName(labelName)) {
-                    result.errors.push_back("Invalid label declaration: " + labelName);
-                    return result;
-                }
-                if (labels.find(labelName) != labels.end()) {
-                    result.errors.push_back("Duplicate label declaration: " + labelName);
-                    return result;
-                }
-                labels[labelName] = currentPc;
-                cleaned = trim(cleaned.substr(colonPos + 1));
-                colonPos = cleaned.find(':');
-            }
-
-            if (cleaned.empty()) continue;
-
-            ParsedLine pl;
-            pl.raw = cleaned;
-            pl.pc = currentPc;
-            tokenize(cleaned, pl.mnemonic, pl.operands);
-            parsedLines.push_back(pl);
-            currentPc += 4;
+    static Program assemble(const std::vector<SourceLine>& lines) {
+        Assembler a;
+        a.pass1(lines);
+        a.pass2();
+        if (!a.errors_.empty()) {
+            std::string m = "assembler errors:";
+            for (const std::string& e : a.errors_) m += "\n  " + e;
+            throw AsmError(m);
         }
-
-        for (const auto& pl : parsedLines) {
-            try {
-                ISA::InstructionFields fields = parseInstruction(pl, labels);
-                result.words.push_back(ISA::encode(fields));
-            } catch (const std::exception& e) {
-                result.errors.push_back("Error at PC 0x" + toHex(pl.pc) + ": " + e.what());
-            }
-        }
-
-        result.success = result.errors.empty();
-        return result;
+        return std::move(a.prog_);
     }
 
 private:
-    struct ParsedLine {
-        uint64_t pc = 0;
-        std::string raw;
+    struct Item {                  // one instruction or data directive collected by pass 1
+        enum Kind { INSTR, WORD, SPACE } kind = INSTR;
+        const SourceLine* src = nullptr;
         std::string mnemonic;
-        std::vector<std::string> operands;
+        std::vector<std::string> ops;
+        uint64_t addr = 0;
     };
 
-    static std::string stripComments(const std::string& s) {
-        size_t p = s.find_first_of(";#");
-        if (p != std::string::npos) return s.substr(0, p);
-        return s;
-    }
+    Program prog_;
+    std::vector<Item> items_;
+    std::vector<std::string> errors_;
+    std::set<std::string> equs_;
 
-    static std::string trim(const std::string& s) {
-        size_t start = s.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) return "";
-        size_t end = s.find_last_not_of(" \t\r\n");
-        return s.substr(start, end - start + 1);
-    }
+    void err(const SourceLine& s, const std::string& m) { errors_.push_back("line " + std::to_string(s.line) + ": " + m); }
 
-    static bool isValidLabelName(const std::string& s) {
-        if (s.empty() || (!std::isalpha(s[0]) && s[0] != '_')) return false;
+    // ---- lexing helpers ----
+    static std::string trim(const std::string& s) { return StackPreprocessor::trim(s); }
+
+    static std::vector<std::string> splitOperands(const std::string& s) {   // commas outside parentheses
+        std::vector<std::string> r; std::string cur; int depth = 0;
         for (char c : s) {
-            if (!std::isalnum(c) && c != '_') return false;
+            if (c == '(') ++depth; else if (c == ')') --depth;
+            if (c == ',' && depth == 0) { r.push_back(trim(cur)); cur.clear(); } else cur += c;
         }
+        if (!trim(cur).empty() || !r.empty()) r.push_back(trim(cur));
+        return r;
+    }
+
+    // ---- expression evaluation: term (+|- term)* ----
+    struct Val { int64_t v = 0; bool usesSymbol = false; };
+
+    bool eval(const SourceLine& src, const std::string& expr, Val& out, bool needDefined) {
+        const std::string e = trim(expr);
+        if (e.empty()) { err(src, "missing value"); return false; }
+        size_t i = 0; int sign = 1; Val acc; bool first = true;
+        while (i < e.size()) {
+            while (i < e.size() && std::isspace(static_cast<unsigned char>(e[i]))) ++i;
+            if (first || e[i] == '+' || e[i] == '-') {
+                if (!first || e[i] == '+' || e[i] == '-') { sign = e[i] == '-' ? -1 : 1; ++i; }
+                while (i < e.size() && std::isspace(static_cast<unsigned char>(e[i]))) ++i;
+            }
+            first = false;
+            size_t j = i;
+            if (j < e.size() && e[j] == '\'') {
+                if (j + 2 < e.size() && e[j + 2] == '\'') { acc.v += sign * static_cast<unsigned char>(e[j + 1]); i = j + 3; continue; }
+                err(src, "bad character literal in '" + e + "'"); return false;
+            }
+            while (j < e.size() && e[j] != '+' && e[j] != '-' && !std::isspace(static_cast<unsigned char>(e[j]))) ++j;
+            const std::string tok = e.substr(i, j - i);
+            i = j;
+            if (tok.empty()) { err(src, "bad expression '" + e + "'"); return false; }
+            if (std::isdigit(static_cast<unsigned char>(tok[0]))) {
+                char* end = nullptr; int base = 10; std::string t = tok;
+                if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) { base = 16; t = t.substr(2); }
+                else if (t.size() > 2 && t[0] == '0' && (t[1] == 'b' || t[1] == 'B')) { base = 2; t = t.substr(2); }
+                const unsigned long long u = std::strtoull(t.c_str(), &end, base);
+                if (*end != '\0') { err(src, "bad number '" + tok + "'"); return false; }
+                acc.v += sign * static_cast<int64_t>(u);
+            } else {
+                auto it = prog_.symbols.find(tok);
+                if (it == prog_.symbols.end()) {
+                    if (needDefined) { err(src, "undefined symbol '" + tok + "'"); return false; }
+                    acc.usesSymbol = true;
+                } else { acc.v += sign * static_cast<int64_t>(it->second); acc.usesSymbol = true; }
+            }
+            sign = 1;
+            while (i < e.size() && std::isspace(static_cast<unsigned char>(e[i]))) ++i;
+            if (i < e.size() && e[i] != '+' && e[i] != '-') { err(src, "bad expression '" + e + "'"); return false; }
+        }
+        out = acc;
         return true;
     }
 
-    static void tokenize(const std::string& line, std::string& mnemonic, std::vector<std::string>& ops) {
-        size_t firstSpace = line.find_first_of(" \t");
-        if (firstSpace == std::string::npos) {
-            mnemonic = toUpper(line);
-            return;
+    // ---- registers ----
+    bool parseReg(const SourceLine& s, const std::string& tok, bool fp, uint8_t& r) {
+        const std::string t = upperStr(trim(tok));
+        if (!fp) {
+            if (t == "SP") { r = ISA::SP; return true; }
+            if (t == "LR") { r = ISA::LR; return true; }
+            if (t == "PC") { r = ISA::PC; return true; }
         }
-
-        mnemonic = toUpper(line.substr(0, firstSpace));
-        std::string rest = line.substr(firstSpace + 1);
-
-        std::string cur;
-        bool inBracket = false;
-        for (char c : rest) {
-            if (c == '[') inBracket = true;
-            else if (c == ']') inBracket = false;
-
-            if (c == ',' && !inBracket) {
-                std::string t = trim(cur);
-                if (!t.empty()) ops.push_back(t);
-                cur.clear();
-            } else {
-                cur += c;
-            }
+        const char want = fp ? 'F' : 'R';
+        if (t.size() >= 2 && t[0] == want && t.find_first_not_of("0123456789", 1) == std::string::npos) {
+            const int n = std::stoi(t.substr(1));
+            if (n < 16) { r = static_cast<uint8_t>(n); return true; }
         }
-        std::string t = trim(cur);
-        if (!t.empty()) ops.push_back(t);
+        err(s, std::string("expected ") + (fp ? "FP register F0..F15" : "register R0..R15/SP/LR/PC") + ", got '" + tok + "'");
+        return false;
     }
 
-    static std::string toUpper(std::string s) {
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
-        return s;
-    }
-
-    static uint8_t parseRegister(const std::string& s) {
-        std::string u = toUpper(trim(s));
-        if (u == "ZERO" || u == "R0" || u == "F0") return 0;
-        if (u == "SP" || u == "R13" || u == "F13") return ISA::SP;
-        if (u == "LR" || u == "R14" || u == "F14") return ISA::LR;
-        if (u == "PC" || u == "R15" || u == "F15") return ISA::PC;
-
-        if (u.size() >= 2 && (u[0] == 'R' || u[0] == 'F')) {
-            size_t idx = 0;
-            int num = std::stoi(u.substr(1), &idx);
-            if (idx == u.size() - 1 && num >= 0 && num < ISA::REGISTER_COUNT) {
-                return static_cast<uint8_t>(num);
-            }
-        }
-        throw std::invalid_argument("Invalid register: " + s);
-    }
-
-    static int64_t parseImmediateOrLabel(const std::string& s, uint64_t pc, const std::unordered_map<std::string, uint64_t>& labels, bool relative) {
-        std::string t = trim(s);
-        auto it = labels.find(t);
-        if (it != labels.end()) {
-            if (relative) {
-                int64_t diff = static_cast<int64_t>(it->second) - static_cast<int64_t>(pc);
-                if (diff % 4 != 0) throw std::invalid_argument("Target address not 4-byte aligned");
-                return diff / 4;
-            }
-            if (it->second % 4 != 0) throw std::invalid_argument("Target address not 4-byte aligned");
-            return static_cast<int64_t>(it->second) / 4;
-        }
-
-        size_t idx = 0;
-        int base = 10;
-        if (t.rfind("0x", 0) == 0 || t.rfind("0X", 0) == 0) base = 16;
-        else if (t.rfind("0b", 0) == 0 || t.rfind("0B", 0) == 0) {
-            t = t.substr(2);
-            base = 2;
-        }
-
-        return std::stoll(t, &idx, base);
-    }
-
-    static void checkRange(int64_t val, int bits, const std::string& ctx) {
-        int64_t minVal = -(1LL << (bits - 1));
-        int64_t maxVal = (1LL << (bits - 1)) - 1;
-        if (val < minVal || val > maxVal) {
-            throw std::out_of_range("Immediate out of range for " + ctx);
-        }
-    }
-
-    static void parseMemoryOperand(const std::string& s, uint8_t& baseReg, int32_t& offset, uint64_t pc, const std::unordered_map<std::string, uint64_t>& labels) {
-        std::string t = trim(s);
-        size_t ob = t.find('[');
-        size_t cb = t.find(']');
-        if (ob == std::string::npos || cb == std::string::npos || ob >= cb) {
-            throw std::invalid_argument("Malformed memory operand: " + s);
-        }
-
-        std::string inside = trim(t.substr(ob + 1, cb - ob - 1));
-        std::string pre = trim(t.substr(0, ob));
-
-        size_t comma = inside.find(',');
-        if (comma != std::string::npos) {
-            baseReg = parseRegister(inside.substr(0, comma));
-            int64_t offVal = parseImmediateOrLabel(inside.substr(comma + 1), pc, labels, false);
-            checkRange(offVal, 16, "memory offset");
-            offset = static_cast<int32_t>(offVal);
-        } else {
-            baseReg = parseRegister(inside);
-            if (!pre.empty()) {
-                int64_t offVal = parseImmediateOrLabel(pre, pc, labels, false);
-                checkRange(offVal, 16, "memory offset");
-                offset = static_cast<int32_t>(offVal);
-            } else {
-                offset = 0;
-            }
-        }
-    }
-
-    static ISA::InstructionFields parseInstruction(const ParsedLine& pl, const std::unordered_map<std::string, uint64_t>& labels) {
-        ISA::InstructionFields f;
-        f.opcode = ISA::opcodeFromMnemonic(pl.mnemonic);
-        ISA::InstructionFormat fmt = ISA::formatOf(f.opcode);
-
-        switch (fmt) {
-            case ISA::InstructionFormat::R_TYPE: {
-                if (f.opcode == ISA::Opcode::NOP || f.opcode == ISA::Opcode::HALT || f.opcode == ISA::Opcode::RETI) {
-                    return f;
+    // ---- pass 1 ----
+    void pass1(const std::vector<SourceLine>& lines) {
+        bool inData = false;
+        uint64_t textCount = 0, dataCount = 0;
+        for (const SourceLine& src : lines) {
+            std::string code = trim(StackPreprocessor::stripComment(src.text));
+            for (;;) {                                                // leading labels
+                const size_t colon = code.find(':');
+                if (colon == std::string::npos) break;
+                const std::string name = trim(code.substr(0, colon));
+                if (name.empty() || name.find_first_of(" \t,()") != std::string::npos) break;
+                const uint64_t addr = inData ? dataCount * 8 : textCount * 4;
+                if (prog_.symbols.count(name)) err(src, "duplicate symbol '" + name + "'");
+                else {
+                    prog_.symbols[name] = addr;
+                    (inData ? prog_.dataLabels : prog_.textLabels)[addr] = name;
                 }
-                if (ISA::isUnary(f.opcode)) {
-                    if (pl.operands.size() < 2) throw std::invalid_argument("Unary requires 2 operands (rd, rs1)");
-                    f.rd = parseRegister(pl.operands[0]);
-                    f.rs1 = parseRegister(pl.operands[1]);
-                    return f;
-                }
-                if (pl.operands.size() < 3) throw std::invalid_argument("Binary R-type requires 3 operands (rd, rs1, rs2/imm)");
-                f.rd = parseRegister(pl.operands[0]);
-                f.rs1 = parseRegister(pl.operands[1]);
-
-                std::string op2 = pl.operands[2];
-                try {
-                    f.rs2 = parseRegister(op2);
-                    f.modifier = 0;
-                } catch (...) {
-                    f.modifier = 1;
-                    int64_t imm = parseImmediateOrLabel(op2, pl.pc, labels, false);
-                    checkRange(imm, 17, "R-type immediate");
-                    f.immediate = static_cast<int32_t>(imm);
-                }
-                break;
+                code = trim(code.substr(colon + 1));
             }
+            if (code.empty()) continue;
+            const size_t sp = code.find_first_of(" \t");
+            const std::string head = sp == std::string::npos ? code : code.substr(0, sp);
+            const std::string rest = sp == std::string::npos ? "" : trim(code.substr(sp));
+            const std::string H = upperStr(head);
 
-            case ISA::InstructionFormat::I_TYPE: {
-                if (f.opcode == ISA::Opcode::LOAD || f.opcode == ISA::Opcode::FLOAD ||
-                    f.opcode == ISA::Opcode::STORE || f.opcode == ISA::Opcode::FSTORE) {
-                    if (pl.operands.size() < 2) throw std::invalid_argument("Memory instruction requires 2 operands (rd, [rs1, offset])");
-                    f.rd = parseRegister(pl.operands[0]);
-                    parseMemoryOperand(pl.operands[1], f.rs1, f.immediate, pl.pc, labels);
-                    f.modifier = 0;
-                } else if (f.opcode == ISA::Opcode::RDSR) {
-                    if (pl.operands.size() < 2) throw std::invalid_argument("RDSR requires 2 operands (rd, sr)");
-                    f.rd = parseRegister(pl.operands[0]);
-                    int64_t sr = parseImmediateOrLabel(pl.operands[1], pl.pc, labels, false);
-                    checkRange(sr, 16, "status register index");
-                    f.immediate = static_cast<int32_t>(sr);
-                    f.modifier = 0;
-                } else if (f.opcode == ISA::Opcode::WRSR) {
-                    if (pl.operands.size() < 2) throw std::invalid_argument("WRSR requires 2 operands (rs1, sr)");
-                    f.rs1 = parseRegister(pl.operands[0]);
-                    int64_t sr = parseImmediateOrLabel(pl.operands[1], pl.pc, labels, false);
-                    checkRange(sr, 16, "status register index");
-                    f.immediate = static_cast<int32_t>(sr);
-                    f.modifier = 0;
-                }
-                break;
+            if (H == ".TEXT") { inData = false; continue; }
+            if (H == ".DATA") { inData = true; continue; }
+            if (H == ".EQU") {
+                std::vector<std::string> o = splitOperands(rest);
+                Val v;
+                if (o.size() != 2 || !eval(src, o[1], v, true)) { if (o.size() != 2) err(src, ".equ NAME, value"); continue; }
+                if (prog_.symbols.count(o[0])) err(src, "duplicate symbol '" + o[0] + "'");
+                else prog_.symbols[o[0]] = static_cast<uint64_t>(v.v);
+                continue;
             }
-
-            case ISA::InstructionFormat::B_TYPE: {
-                if (f.opcode == ISA::Opcode::JZ || f.opcode == ISA::Opcode::JNZ) {
-                    if (pl.operands.size() < 2) throw std::invalid_argument("Branch requires 2 operands (rs1, target)");
-                    f.rs1 = parseRegister(pl.operands[0]);
-                    f.rs2 = 0;
-                    int64_t off = parseImmediateOrLabel(pl.operands[1], pl.pc, labels, true);
-                    checkRange(off, 18, "branch offset");
-                    f.immediate = static_cast<int32_t>(off);
+            if (H == ".STACK") {
+                Val v;
+                if (eval(src, rest, v, true)) {
+                    if (v.v <= 0 || v.v % 8) err(src, ".stack size must be a positive multiple of 8 bytes");
+                    else prog_.stackBytes = static_cast<uint64_t>(v.v);
+                }
+                continue;
+            }
+            if (H == ".WORD" || H == ".SPACE") {
+                if (!inData) { err(src, head + " is only allowed in a .data section"); continue; }
+                Item it; it.src = &src; it.addr = dataCount * 8;
+                if (H == ".WORD") {
+                    it.kind = Item::WORD; it.ops = splitOperands(rest);
+                    if (it.ops.empty()) { err(src, ".word needs at least one value"); continue; }
+                    dataCount += it.ops.size();
                 } else {
-                    if (pl.operands.size() < 3) throw std::invalid_argument("Branch requires 3 operands (rs1, rs2, target)");
-                    f.rs1 = parseRegister(pl.operands[0]);
-                    f.rs2 = parseRegister(pl.operands[1]);
-                    int64_t off = parseImmediateOrLabel(pl.operands[2], pl.pc, labels, true);
-                    checkRange(off, 18, "branch offset");
-                    f.immediate = static_cast<int32_t>(off);
+                    Val v;
+                    if (!eval(src, rest, v, true) || v.v < 0 || v.v > (1 << 20)) { err(src, ".space needs a count 0..1048576"); continue; }
+                    it.kind = Item::SPACE; it.ops = {std::to_string(v.v)};
+                    dataCount += static_cast<uint64_t>(v.v);
                 }
+                items_.push_back(it);
+                continue;
+            }
+            if (H[0] == '.') { err(src, "unknown directive '" + head + "'"); continue; }
+            if (inData) { err(src, "instruction in .data section"); continue; }
+            Item it; it.kind = Item::INSTR; it.src = &src; it.mnemonic = H; it.ops = splitOperands(rest);
+            it.addr = textCount * 4;
+            ++textCount;
+            items_.push_back(it);
+        }
+    }
+
+    // ---- pass 2 ----
+    void pass2() {
+        for (Item& it : items_) {
+            if (it.kind == Item::WORD) {
+                for (const std::string& o : it.ops) { Val v; if (eval(*it.src, o, v, true)) prog_.data.push_back(static_cast<ISA::Word>(v.v)); else prog_.data.push_back(0); }
+            } else if (it.kind == Item::SPACE) {
+                prog_.data.insert(prog_.data.end(), static_cast<size_t>(std::stoull(it.ops[0])), 0);
+            } else {
+                ISA::InstrWord w = 0;
+                if (!encode(it, w)) w = 0xFFFFFFFFu;
+                prog_.text.push_back(w);
+                prog_.lines.push_back({it.src->line, StackPreprocessor::trim(StackPreprocessor::stripComment(it.src->text)), it.src->origin});
+            }
+        }
+    }
+
+    bool fitsSigned(int64_t v, int bits) { return v >= -(int64_t(1) << (bits - 1)) && v < (int64_t(1) << (bits - 1)); }
+
+    bool encode(const Item& it, ISA::InstrWord& word) {
+        const SourceLine& s = *it.src;
+        ISA::Opcode op;
+        try { op = ISA::opcodeFromMnemonic(it.mnemonic); }
+        catch (const std::invalid_argument&) { err(s, "unknown mnemonic '" + it.mnemonic + "'"); return false; }
+        const AsmSyntax syn = syntaxOf(op);
+        using F = AsmSyntax::Form;
+        const std::vector<std::string>& o = it.ops;
+        ISA::InstructionFields f; f.opcode = op;
+        auto need = [&](size_t n) {
+            if (o.size() != n) { err(s, it.mnemonic + " expects " + std::to_string(n) + " operand(s), got " + std::to_string(o.size())); return false; }
+            return true;
+        };
+        auto imm = [&](const std::string& e, int bits, int32_t& out) {
+            Val v;
+            if (!eval(s, e, v, true)) return false;
+            if (!fitsSigned(v.v, bits)) { err(s, "immediate " + std::to_string(v.v) + " does not fit in " + std::to_string(bits) + " signed bits"); return false; }
+            out = static_cast<int32_t>(v.v); return true;
+        };
+        auto branchOffset = [&](const std::string& e, int bits, int32_t& out) {
+            Val v;
+            if (!eval(s, e, v, true)) return false;
+            int64_t off = v.v;
+            if (v.usesSymbol) {
+                const int64_t d = v.v - static_cast<int64_t>(it.addr);
+                if (d % 4) { err(s, "branch target is not 4-byte aligned"); return false; }
+                off = d / 4;
+            }
+            if (!fitsSigned(off, bits)) { err(s, "branch target out of range"); return false; }
+            out = static_cast<int32_t>(off); return true;
+        };
+        bool ok = true;
+        switch (syn.form) {
+            case F::NONE: ok = need(0); break;
+            case F::D_S:  ok = need(2) && parseReg(s, o[0], syn.fpD, f.rd) && parseReg(s, o[1], syn.fpS, f.rs1); break;
+            case F::D_S_T:
+                ok = need(3) && parseReg(s, o[0], syn.fpD, f.rd) && parseReg(s, o[1], syn.fpS, f.rs1);
+                if (!ok) break;
+                if (syn.allowImm) {
+                    const std::string t = upperStr(trim(o[2]));
+                    const bool isReg = t == "SP" || t == "LR" || t == "PC" ||
+                        (t.size() >= 2 && t[0] == 'R' && t.find_first_not_of("0123456789", 1) == std::string::npos);
+                    if (isReg) ok = parseReg(s, o[2], false, f.rs2);
+                    else { f.modifier = 1; ok = imm(o[2], 17, f.immediate); }
+                } else ok = parseReg(s, o[2], syn.fpT, f.rs2);
+                break;
+            case F::MEM: {
+                ok = need(2) && parseReg(s, o[0], syn.fpD, f.rd);
+                if (!ok) break;
+                const std::string a = trim(o[1]);
+                const size_t lp = a.find('('), rp = a.rfind(')');
+                if (lp != std::string::npos && rp == a.size() - 1 && rp > lp) {
+                    const std::string disp = trim(a.substr(0, lp));
+                    ok = parseReg(s, a.substr(lp + 1, rp - lp - 1), false, f.rs1) && (disp.empty() || imm(disp, 16, f.immediate));
+                } else { f.rs1 = ISA::ZERO; ok = imm(a, 16, f.immediate); }
                 break;
             }
-
-            case ISA::InstructionFormat::J_TYPE: {
-                if (f.opcode == ISA::Opcode::RET) {
-                    f.immediate = 0;
-                } else {
-                    if (pl.operands.empty()) throw std::invalid_argument("Jump requires target operand");
-                    int64_t off = parseImmediateOrLabel(pl.operands[0], pl.pc, labels, true);
-                    checkRange(off, 26, "jump target offset");
-                    f.immediate = static_cast<int32_t>(off);
-                }
+            case F::B_S_T: ok = need(3) && parseReg(s, o[0], false, f.rs1) && parseReg(s, o[1], false, f.rs2) && branchOffset(o[2], 18, f.immediate); break;
+            case F::B_S:   ok = need(2) && parseReg(s, o[0], false, f.rs1) && branchOffset(o[1], 18, f.immediate); break;
+            case F::J:     ok = need(1) && branchOffset(o[0], 26, f.immediate); break;
+            case F::RDSR: case F::WRSR: {
+                const bool rd = syn.form == F::RDSR;
+                ok = need(2);
+                if (!ok) break;
+                const std::string& selTok = rd ? o[1] : o[0];
+                const std::string& regTok = rd ? o[0] : o[1];
+                ok = parseReg(s, regTok, false, rd ? f.rd : f.rs1);
+                if (!ok) break;
+                const std::string S = upperStr(trim(selTok));
+                int sel = -1;
+                for (int i = 0; i < 8; ++i) if (S == specialRegName(i)) sel = i;
+                if (sel < 0) { int32_t v; if (!imm(selTok, 16, v)) { ok = false; break; } sel = v; }
+                if (!ExceptionHandler::validSelect(sel)) { err(s, "bad special-register select '" + selTok + "'"); ok = false; break; }
+                f.immediate = sel;
                 break;
             }
         }
-        return f;
-    }
-
-    static std::string toHex(uint64_t val) {
-        std::ostringstream ss;
-        ss << std::hex << std::uppercase << val;
-        return ss.str();
+        if (!ok) return false;
+        // Register-writing instructions may not target R15 (PC is read-only).
+        const Exec::RegUse u = Exec::regUse(f);
+        if (u.writes && !u.destFp && u.dest == ISA::PC && op != ISA::Opcode::CALL) { err(s, "R15 (PC) cannot be written"); return false; }
+        word = ISA::encode(f);
+        return true;
     }
 };
+
 
