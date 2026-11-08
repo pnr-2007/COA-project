@@ -297,6 +297,8 @@ private:
             case Op::SIN: return uint64_t(AluOp::SIN);
             case Op::COS: return uint64_t(AluOp::COS);
             case Op::LOG: return uint64_t(AluOp::LOG);
+            case Op::EXP: return uint64_t(AluOp::EXP);
+            case Op::POW: return uint64_t(AluOp::POW);
             case Op::CMP: return uint64_t(AluOp::CMP);
             default:      return uint64_t(AluOp::NONE);
         }
