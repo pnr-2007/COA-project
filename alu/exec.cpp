@@ -68,7 +68,6 @@ public:
     }
 
     static Fault validate(const ISA::InstructionFields& f) {
-        if (f.opcode == Opcode::EXP || f.opcode == Opcode::POW) return Fault::IllegalInstruction;
         if ((f.opcode == Opcode::LOAD || f.opcode == Opcode::STORE || f.opcode == Opcode::FLOAD || f.opcode == Opcode::FSTORE) && f.modifier != 0)
             return Fault::IllegalInstruction;
         if (f.type() == ISA::InstructionType::FP && !ISA::isUnary(f.opcode) && f.modifier != 0) return Fault::IllegalInstruction;
@@ -110,21 +109,41 @@ public:
 
     static constexpr bool isLongOp(Opcode op) {
         return op == Opcode::MUL || op == Opcode::DIV || op == Opcode::MOD ||
-               op == Opcode::SIN || op == Opcode::COS || op == Opcode::LOG;
+               op == Opcode::SIN || op == Opcode::COS || op == Opcode::LOG ||
+               op == Opcode::EXP || op == Opcode::POW;
     }
 
     static bool alu(Opcode op, Word a, Word b, Word& out) {
+        uint8_t flags = 0;
+        return alu(op, a, b, out, flags);
+    }
+
+    static bool alu(Opcode op, Word a, Word b, Word& out, uint8_t& flags) {
+        constexpr uint8_t OVF = static_cast<uint8_t>(ALU::StatusFlags::OVERFLOW_BIT);
+        constexpr uint8_t DZ  = static_cast<uint8_t>(ALU::StatusFlags::DIVIDE_BY_ZERO_BIT);
+        auto fromResult = [&](const ALU::Result& r) {
+            out = r.value;
+            flags = static_cast<uint8_t>((r.overflow ? OVF : 0) | (r.divideByZero ? DZ : 0));
+        };
+        flags = 0;
         bool ovf = false;
         switch (op) {
-            case Opcode::ADD: out = ALU::add(a, b).value; return true;
-            case Opcode::SUB: out = ALU::sub(a, b).value; return true;
-            case Opcode::MUL: out = ALU::fixedMul(a, b, ovf); return true;
-            case Opcode::DIV: out = ALU::fixedDiv(a, b, ovf); return true;
+            case Opcode::ADD: fromResult(ALU::add(a, b)); return true;
+            case Opcode::SUB: fromResult(ALU::sub(a, b)); return true;
+            case Opcode::MUL:
+                out = ALU::fixedMul(a, b, ovf);
+                flags = ovf ? OVF : 0;
+                return true;
+            case Opcode::DIV:
+                out = ALU::fixedDiv(a, b, ovf);
+                flags = static_cast<uint8_t>((ovf ? OVF : 0) | (b == 0 ? DZ : 0));
+                return true;
             case Opcode::MOD: {
                 auto neg  = [](Word w) { return static_cast<int64_t>(w) < 0; };
                 auto absw = [&](Word w) { return neg(w) ? Word(0) - w : w; };
                 const Word rem = ALU::modulus(absw(a), absw(b)).value;
                 out = neg(a) ? Word(0) - rem : rem;
+                if (b == 0) flags = OVF | DZ;
                 return true;
             }
             case Opcode::AND: out = ALU::bitwiseAnd(a, b).value; return true;
@@ -136,7 +155,9 @@ public:
             case Opcode::ASR: out = ALU::asr(a, b).value;        return true;
             case Opcode::SIN: out = ALU::evaluateSineSigned(a).value;   return true;
             case Opcode::COS: out = ALU::evaluateCosineSigned(a).value; return true;
-            case Opcode::LOG: out = ALU::evaluateLog2(a).value;         return true;
+            case Opcode::LOG: fromResult(ALU::evaluateLog2(a));         return true;
+            case Opcode::EXP: fromResult(ALU::evaluateExp2(a));         return true;
+            case Opcode::POW: fromResult(ALU::evaluatePow(a, b));       return true;
             case Opcode::CMP: {
                 const ALU::Result d = ALU::sub(a, b);
                 const bool less = d.negative != d.overflow;
