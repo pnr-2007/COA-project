@@ -64,6 +64,27 @@ private:
         }
     }
 
+    std::vector<StageView> stageView() const override {
+        auto mk = [](const char* n, const Slot& s, std::string note = "") {
+            StageView v; v.name = n; v.valid = s.valid; v.pc = s.pc; v.word = s.word;
+            v.fault = s.fault; v.note = std::move(note); return v;
+        };
+        std::vector<StageView> r;
+        StageView f; f.name = "IF"; f.hasWord = false; f.pc = pc_;
+        f.valid = fetchEnabled_ && !halted_;
+        f.note = !fetchEnabled_ ? "stopped" : (ifWait_ ? "fetch wait " + std::to_string(ifWait_) : "");
+        r.push_back(f);
+        StageView d; d.name = "ID"; d.valid = ifId_.valid; d.pc = ifId_.pc; d.word = ifId_.word;
+        d.fault = ifId_.fetchFault ? Fault::FetchFault : Fault::None;
+        r.push_back(d);
+        r.push_back(busy_.active ? mk("EX", busy_.result, "multi-cycle, " + std::to_string(busy_.remaining) + " left")
+                                 : mk("EX", idEx_));
+        r.push_back(mk("MEM1", exM1_));
+        r.push_back(m2Started_ ? mk("MEM2", m1M2_, "mem wait " + std::to_string(m2Wait_)) : mk("MEM2", m1M2_));
+        r.push_back(mk("WB", m2Wb_));
+        return r;
+    }
+
     void clearBackEnd() override {
         m2Started_ = false;
         m2Wait_ = 0;
@@ -126,7 +147,9 @@ private:
                 const Word base = resolve(s.w.srcA, s.w.srcAFp, Stage6::MEM1, s.pc, oldM1, oldM2, oldWb);
                 const MemoryStages6::Mem1Result r = ms_.address(base, s.w.immediate);
                 s.value = r.addr;
-                if (r.fault) {
+                const bool stackBad =
+                    stackViolation(s.w.srcA, r.addr, s.w.memWrite, s.pc, s.w.srcA == ISA::SP ? base : regs_[ISA::SP]);
+                if (r.fault || stackBad) {
                     s.fault = Fault::MemoryFault;
                     s.faultValue = r.addr;
                     s.regWrite = false;
