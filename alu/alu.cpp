@@ -78,6 +78,7 @@ public:
         sineLUT.resize(POLY_LUT_SIZE);
         cosineLUT.resize(POLY_LUT_SIZE);
         log2LUT.resize(POLY_LUT_SIZE);
+        exp2LUT.resize(POLY_LUT_SIZE);
 
         for (uint32_t i = 0; i < POLY_LUT_SIZE; ++i) {
             double normalized_x = static_cast<double>(i) / POLY_SEGMENTS;
@@ -90,6 +91,7 @@ public:
             
             double log_x = 1.0 + normalized_x;
             log2LUT[i] = static_cast<Word>(std::log2(log_x) * FX_SCALE);
+            exp2LUT[i] = static_cast<Word>(std::exp2(normalized_x) * static_cast<double>(FX_SCALE));
         }
     }
 
@@ -202,6 +204,75 @@ public:
         return r;
     }
 
+    static Result evaluateExp2(Word x_fixed) {
+        ensureLUTs();
+        Result r;
+        const int64_t sx = static_cast<int64_t>(x_fixed);
+        const int64_t n = sx >> FX_FRAC_BITS;
+        if (n >= 31) {
+            r.value = static_cast<Word>(INT64_MAX);
+            r.overflow = true;
+            updateFlags(r);
+            return r;
+        }
+        if (n < -33) {
+            updateFlags(r);
+            return r;
+        }
+        const Word mantissa = interpolateFromLUT(x_fixed & FX_FRAC_MASK, exp2LUT).value;
+        if (n >= 0) {
+            r.value = mantissa << n;
+        } else {
+            const int sh = static_cast<int>(-n);
+            r.value = (mantissa + (Word(1) << (sh - 1))) >> sh;
+        }
+        updateFlags(r);
+        return r;
+    }
+
+    static Result evaluatePow(Word base, Word exponent) {
+        ensureLUTs();
+        Result r;
+        const int64_t sa = static_cast<int64_t>(base);
+        const int64_t sb = static_cast<int64_t>(exponent);
+        if (sb == 0) {
+            r.value = FX_SCALE;
+            updateFlags(r);
+            return r;
+        }
+        if (sa == 0) {
+            if (sb > 0) {
+                updateFlags(r);
+            } else {
+                r.value = static_cast<Word>(INT64_MAX);
+                r.overflow = true;
+                r.divideByZero = true;
+                updateFlags(r);
+            }
+            return r;
+        }
+        if (sa < 0) {
+            r.overflow = true;
+            updateFlags(r);
+            return r;
+        }
+        const Result l = evaluateLog2(base);
+        bool ovf = false;
+        const Word p = fxMul(exponent, l.value, ovf);
+        if (ovf) {
+            if (isNeg(exponent) != isNeg(l.value)) {
+                r.overflow = true;
+                updateFlags(r);
+                return r;
+            }
+            r.value = static_cast<Word>(INT64_MAX);
+            r.overflow = true;
+            updateFlags(r);
+            return r;
+        }
+        return evaluateExp2(p);
+    }
+
     static Result add(Word a, Word b) { return claadd(a, b, 0); }
     static Result sub(Word a, Word b) { return claadd(a, ~b, 1); }
     static Result addWithCarry(Word a, Word b, bool cin) { return claadd(a, b, cin ? 1 : 0); }
@@ -301,6 +372,7 @@ private:
     static inline std::vector<Word> sineLUT;
     static inline std::vector<Word> cosineLUT;
     static inline std::vector<Word> log2LUT;
+    static inline std::vector<Word> exp2LUT;
 
     static void ensureLUTs() {
         if (sineLUT.empty()) initTranscendentalLUTs();
