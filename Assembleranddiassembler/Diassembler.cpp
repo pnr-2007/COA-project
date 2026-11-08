@@ -1,124 +1,77 @@
+#pragma once
 
-#include "isa.cpp"
-#include <cstdint>
-#include <iomanip>
+// Disassembler: 32-bit instruction word -> assembly text (assignment 2b).
+
+#include "asm_syntax.cpp"
+#include <cstdio>
+#include <map>
 #include <sstream>
-#include <string>
-#include <string_view>
-#include <vector>
 
 class Disassembler {
 public:
-    static std::string disassembleWord(ISA::InstrWord word, uint64_t pc = 0) {
-        ISA::InstructionFields f;
-        try {
-            f = ISA::decode(word);
-        } catch (...) {
-            return "<illegal_instruction: 0x" + toHex(word, 8) + ">";
-        }
-        return formatFields(f, pc);
+    // `symbols` (address -> label) is optional; when given, branch targets print as labels.
+    static std::string regName(unsigned r, bool fp = false) {
+        if (fp) return "F" + std::to_string(r);
+        if (r == ISA::SP) return "SP";
+        if (r == ISA::LR) return "LR";
+        if (r == ISA::PC) return "PC";
+        return "R" + std::to_string(r);
     }
 
-    static std::vector<std::string> disassembleBlock(const std::vector<ISA::InstrWord>& words, uint64_t basePc = 0) {
-        std::vector<std::string> lines;
-        lines.reserve(words.size());
-        for (size_t i = 0; i < words.size(); ++i) {
-            uint64_t pc = basePc + i * 4;
-            std::ostringstream line;
-            line << "0x" << toHex(pc, 8) << ":  "
-                 << toHex(words[i], 8) << "    "
-                 << disassembleWord(words[i], pc);
-            lines.push_back(line.str());
+    static std::string format(ISA::InstrWord word, uint64_t pc = 0, const std::map<uint64_t, std::string>* symbols = nullptr) {
+        ISA::InstructionFields f;
+        try { f = ISA::decode(word); }
+        catch (const std::invalid_argument&) { return hexWord(word); }
+
+        using F = AsmSyntax::Form;
+        const AsmSyntax s = syntaxOf(f.opcode);
+        std::string out(ISA::mnemonicOf(f.opcode));
+        auto target = [&](int32_t imm) {
+            const uint64_t t = pc + static_cast<uint64_t>(static_cast<int64_t>(imm) * 4);
+            if (symbols) { auto it = symbols->find(t); if (it != symbols->end()) return it->second; }
+            char b[32]; std::snprintf(b, sizeof b, "0x%llX", (unsigned long long)t);
+            return std::string(b) + " (" + (imm >= 0 ? "+" : "") + std::to_string(imm) + ")";
+        };
+        switch (s.form) {
+            case F::NONE: break;
+            case F::D_S:
+                out += " " + regName(f.rd, s.fpD) + ", " + regName(f.rs1, s.fpS); break;
+            case F::D_S_T:
+                out += " " + regName(f.rd, s.fpD) + ", " + regName(f.rs1, s.fpS) + ", ";
+                out += f.modifier ? std::to_string(f.immediate) : regName(f.rs2, s.fpT);
+                break;
+            case F::MEM:
+                out += " " + regName(f.rd, s.fpD) + ", " + std::to_string(f.immediate) + "(" + regName(f.rs1) + ")";
+                break;
+            case F::B_S_T: out += " " + regName(f.rs1) + ", " + regName(f.rs2) + ", " + target(f.immediate); break;
+            case F::B_S:   out += " " + regName(f.rs1) + ", " + target(f.immediate); break;
+            case F::J:     out += " " + target(f.immediate); break;
+            case F::RDSR:  out += " " + regName(f.rd) + ", " + specialRegName(static_cast<unsigned>(f.immediate)); break;
+            case F::WRSR:  out += std::string(" ") + specialRegName(static_cast<unsigned>(f.immediate)) + ", " + regName(f.rs1); break;
         }
-        return lines;
+        return out;
+    }
+
+    // "0x00000010: 04C40008  ADD R1, R2, R3"
+    static std::string line(ISA::InstrWord word, uint64_t pc, const std::map<uint64_t, std::string>* symbols = nullptr) {
+        char b[48]; std::snprintf(b, sizeof b, "0x%05llX: %08X  ", (unsigned long long)pc, word);
+        return b + format(word, pc, symbols);
+    }
+
+    // Hex/binary word strings (assignment: "parses binary or hexadecimal word strings").
+    // Accepts "0x1A2B3C4D", "1A2B3C4D" or a 32-digit binary string (optionally "0b" prefixed).
+    static ISA::InstrWord parseWord(std::string s) {
+        std::string t;
+        for (char c : s) if (!std::isspace(static_cast<unsigned char>(c)) && c != '_') t += c;
+        if (t.size() > 2 && t[0] == '0' && (t[1] == 'b' || t[1] == 'B')) return static_cast<ISA::InstrWord>(std::stoull(t.substr(2), nullptr, 2));
+        if (t.size() == 32 && t.find_first_not_of("01") == std::string::npos) return static_cast<ISA::InstrWord>(std::stoull(t, nullptr, 2));
+        if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) t = t.substr(2);
+        return static_cast<ISA::InstrWord>(std::stoull(t, nullptr, 16));
     }
 
 private:
-    static std::string regName(uint8_t r, bool fp = false) {
-        if (r == 0 && !fp) return "zero";
-        if (r == ISA::SP && !fp) return "sp";
-        if (r == ISA::LR && !fp) return "lr";
-        if (r == ISA::PC && !fp) return "pc";
-        return (fp ? "f" : "r") + std::to_string(r);
-    }
-
-    static std::string formatFields(const ISA::InstructionFields& f, uint64_t pc) {
-        std::string_view m = ISA::mnemonicOf(f.opcode);
-        std::ostringstream ss;
-        ss << m;
-
-        ISA::InstructionFormat fmt = ISA::formatOf(f.opcode);
-        bool isFp = (ISA::typeOf(f.opcode) == ISA::InstructionType::FP) ||
-                    (f.opcode == ISA::Opcode::FLOAD) || (f.opcode == ISA::Opcode::FSTORE);
-
-        switch (fmt) {
-            case ISA::InstructionFormat::R_TYPE: {
-                if (f.opcode == ISA::Opcode::NOP || f.opcode == ISA::Opcode::HALT || f.opcode == ISA::Opcode::RETI) {
-                    return ss.str();
-                }
-                ss << " ";
-                if (ISA::isUnary(f.opcode)) {
-                    bool destFp = isFp && (f.opcode != ISA::Opcode::FCVTQD && f.opcode != ISA::Opcode::FMVXD);
-                    bool srcFp = isFp && (f.opcode != ISA::Opcode::FCVTDQ && f.opcode != ISA::Opcode::FMVDX);
-                    ss << regName(f.rd, destFp) << ", " << regName(f.rs1, srcFp);
-                } else {
-                    bool destFp = isFp && (f.opcode != ISA::Opcode::FCMP);
-                    ss << regName(f.rd, destFp) << ", " << regName(f.rs1, isFp) << ", ";
-                    if (f.modifier) {
-                        ss << f.immediate;
-                    } else {
-                        ss << regName(f.rs2, isFp);
-                    }
-                }
-                break;
-            }
-
-            case ISA::InstructionFormat::I_TYPE: {
-                ss << " ";
-                if (f.opcode == ISA::Opcode::LOAD || f.opcode == ISA::Opcode::FLOAD ||
-                    f.opcode == ISA::Opcode::STORE || f.opcode == ISA::Opcode::FSTORE) {
-                    bool dataFp = (f.opcode == ISA::Opcode::FLOAD || f.opcode == ISA::Opcode::FSTORE);
-                    ss << regName(f.rd, dataFp) << ", ["
-                       << regName(f.rs1, false);
-                    if (f.immediate != 0) ss << ", " << f.immediate;
-                    ss << "]";
-                } else if (f.opcode == ISA::Opcode::RDSR) {
-                    ss << regName(f.rd, false) << ", " << f.immediate;
-                } else if (f.opcode == ISA::Opcode::WRSR) {
-                    ss << regName(f.rs1, false) << ", " << f.immediate;
-                }
-                break;
-            }
-
-            case ISA::InstructionFormat::B_TYPE: {
-                ss << " ";
-                if (f.opcode == ISA::Opcode::JZ || f.opcode == ISA::Opcode::JNZ) {
-                    ss << regName(f.rs1, false) << ", ";
-                } else {
-                    ss << regName(f.rs1, false) << ", " << regName(f.rs2, false) << ", ";
-                }
-                uint64_t target = pc + static_cast<int64_t>(f.immediate) * 4;
-                ss << "0x" << toHex(target, 0);
-                break;
-            }
-
-            case ISA::InstructionFormat::J_TYPE: {
-                if (f.opcode != ISA::Opcode::RET) {
-                    ss << " ";
-                    uint64_t target = pc + static_cast<int64_t>(f.immediate) * 4;
-                    ss << "0x" << toHex(target, 0);
-                }
-                break;
-            }
-        }
-        return ss.str();
-    }
-
-    static std::string toHex(uint64_t val, int width) {
-        std::ostringstream ss;
-        ss << std::hex << std::uppercase;
-        if (width > 0) ss << std::setfill('0') << std::setw(width);
-        ss << val;
-        return ss.str();
+    static std::string hexWord(ISA::InstrWord w) {
+        char b[32]; std::snprintf(b, sizeof b, ".word 0x%08X", w); return b;
     }
 };
+
