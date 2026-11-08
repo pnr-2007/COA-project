@@ -37,6 +37,28 @@ private:
         return {e.valid, e.regWrite, inRw ? false : e.memRead, e.rd, e.value, e.destFp};
     }
 
+    std::vector<StageView> stageView() const override {
+        auto mk = [](const char* n, const Slot& s, std::string note = "") {
+            StageView v; v.name = n; v.valid = s.valid; v.pc = s.pc; v.word = s.word;
+            v.fault = s.fault; v.note = std::move(note); return v;
+        };
+        std::vector<StageView> r;
+        StageView f; f.name = "IF"; f.hasWord = false; f.pc = pc_;
+        f.valid = fetchEnabled_ && !halted_;
+        f.note = !fetchEnabled_ ? "stopped" : (ifWait_ ? "fetch wait " + std::to_string(ifWait_) : "");
+        r.push_back(f);
+        StageView d;
+        if (busy_.active) d = mk("DE+EX", busy_.result, "multi-cycle, " + std::to_string(busy_.remaining) + " left");
+        else {
+            d.name = "DE+EX"; d.valid = ifId_.valid; d.pc = ifId_.pc; d.word = ifId_.word;
+            d.fault = ifId_.fetchFault ? Fault::FetchFault : Fault::None;
+        }
+        r.push_back(d);
+        r.push_back(maHoldValid_ ? mk("MA", maHold_, "mem wait " + std::to_string(maWait_)) : mk("MA", exMa_));
+        r.push_back(mk("RW", maRw_));
+        return r;
+    }
+
     void clearBackEnd() override {
         maHoldValid_ = false;
         maWait_ = 0;
@@ -147,7 +169,12 @@ private:
         out.destFp   = w.destFp;
         uint32_t latency = 1;
 
-        if (executeCore(out, a, b, latency, true) == Core::IllegalRounding) {
+        const Core core = executeCore(out, a, b, latency, true);
+        if (core == Core::StackViolation) {      // precise MEMORY_FAULT, reported at RW
+            stopFetch = true;
+            return;
+        }
+        if (core == Core::IllegalRounding) {
             out.regWrite = false;
             out.fault = Fault::IllegalInstruction;
             out.faultValue = ifId_.word;
