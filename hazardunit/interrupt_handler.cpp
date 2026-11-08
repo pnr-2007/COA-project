@@ -26,4 +26,4 @@ public:
         beginTrap();
         return sr_[TVEC] + VECTOR_STRIDE * (VECTOR_BASE + line);
     }
-};
+}
